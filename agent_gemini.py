@@ -146,6 +146,37 @@ def run_shell(command: str) -> str:
     except Exception as e: return f"Error: {e}"
 
 # Tools list removed - handled by system prompt
+
+def extract_json_objects(text: str) -> list:
+    """Extract all valid JSON objects from a string by tracking brace depth."""
+    objects = []
+    i = 0
+    while i < len(text):
+        if text[i] == '{':
+            depth = 0
+            start = i
+            in_string = False
+            escape_next = False
+            while i < len(text):
+                char = text[i]
+                if escape_next:
+                    escape_next = False
+                elif char == '\\' and in_string:
+                    escape_next = True
+                elif char == '"' and not escape_next:
+                    in_string = not in_string
+                elif not in_string:
+                    if char == '{':
+                        depth += 1
+                    elif char == '}':
+                        depth -= 1
+                        if depth == 0:
+                            objects.append(text[start:i+1])
+                            break
+                i += 1
+        i += 1
+    return objects
+
 available_functions = {"read_file": read_file, "write_file": write_file, "list_files": list_files, "run_shell": run_shell}
 
 def call_gemini_cli(prompt: str):
@@ -376,28 +407,30 @@ AVAILABLE TOOLS:
             
         full_history += f"\n\nASSISTANT: {response_text}"
         
-        # Parse for JSON format tool calls
+        # Parse for JSON format tool calls - handle multiple JSON blocks
+        tool_calls_executed = 0
         if "{" in response_text and "}" in response_text:
-            try:
-                # Find JSON blob
-                start = response_text.find("{")
-                end = response_text.rfind("}") + 1
-                json_str = response_text[start:end]
-                data = json.loads(json_str)
-                
-                if "tool" in data and "args" in data:
-                    tool_name = data["tool"]
-                    args = data["args"]
-                    logger.info(f"🛠️ Tool Call: {tool_name}")
-                    
-                    func = available_functions.get(tool_name)
-                    if func:
-                        resp = func(**args)
-                        if len(str(resp)) > 10000: resp = str(resp)[:5000] + "...[truncated]..." + str(resp)[-5000:]
-                        full_history += f"\n\nTOOL OUTPUT: {str(resp)}"
-                        continue
-            except:
-                pass # Not a tool call or invalid JSON
+            # Extract all JSON objects from the response
+            json_objects = extract_json_objects(response_text)
+            for json_str in json_objects:
+                try:
+                    data = json.loads(json_str)
+                    if "tool" in data and "args" in data:
+                        tool_name = data["tool"]
+                        args = data["args"]
+                        logger.info(f"🛠️ Tool Call: {tool_name}")
+                        
+                        func = available_functions.get(tool_name)
+                        if func:
+                            resp = func(**args)
+                            if len(str(resp)) > 10000: resp = str(resp)[:5000] + "...[truncated]..." + str(resp)[-5000:]
+                            full_history += f"\n\nTOOL OUTPUT ({tool_name}): {str(resp)}"
+                            tool_calls_executed += 1
+                except:
+                    pass # Not a valid tool call JSON
+        
+        if tool_calls_executed > 0:
+            continue  # Continue to next iteration after processing tool calls
 
         logger.info(f"\n🧠 Agent Report:\n{response_text}")
         if build_state.is_verified():
@@ -429,21 +462,26 @@ Fix code (not build files), then run './gradlew assembleDebug detekt'.
         
         full_history += f"\n\nASSISTANT: {response_text}"
         
+        # Parse for JSON format tool calls - handle multiple JSON blocks
+        tool_calls_executed = 0
         if "{" in response_text and "}" in response_text:
-            try:
-                start = response_text.find("{")
-                end = response_text.rfind("}") + 1
-                data = json.loads(response_text[start:end])
-                if "tool" in data and "args" in data:
-                    tool_name = data["tool"]
-                    tool_args = data["args"]
-                    logger.info(f"🛠️ Tool Call: {tool_name}")
-                    func = available_functions.get(tool_name)
-                    if func:
-                        resp = func(**tool_args)
-                        full_history += f"\n\nTOOL OUTPUT: {str(resp)[:5000]}"
-                        continue
-            except: pass
+            json_objects = extract_json_objects(response_text)
+            for json_str in json_objects:
+                try:
+                    data = json.loads(json_str)
+                    if "tool" in data and "args" in data:
+                        tool_name = data["tool"]
+                        tool_args = data["args"]
+                        logger.info(f"🛠️ Tool Call: {tool_name}")
+                        func = available_functions.get(tool_name)
+                        if func:
+                            resp = func(**tool_args)
+                            full_history += f"\n\nTOOL OUTPUT ({tool_name}): {str(resp)[:5000]}"
+                            tool_calls_executed += 1
+                except: pass
+        
+        if tool_calls_executed > 0:
+            continue  # Continue to next iteration after processing tool calls
             
         if build_state.is_verified(): return True
         full_history += "\n\nUSER: Run './gradlew assembleDebug detekt'."
