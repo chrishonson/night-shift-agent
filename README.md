@@ -155,11 +155,23 @@ See [kmp-agentic-ci-template](https://github.com/chrishonson/kmp-agentic-ci-temp
 - Self-hosted runner setup for UI tests
 - Branch protection configuration
 
-### For Other Projects
+### For All Projects
 
-1. Create an `ARCHITECTURE.md` in your project root describing patterns/conventions
-2. Create a `tasks.txt` with your tasks
-3. Run the agent with `--project-dir`
+1. Join the **Branch Protection** club!
+   - Since the agent needs write access, you **MUST** protect your `main` branch.
+   - Go to Repo Settings -> Branches -> Add Rule -> `main` -> Check "Require a pull request before merging".
+2. Create an `ARCHITECTURE.md` in your project root describing patterns/conventions.
+3. Create a `tasks.txt` with your tasks.
+4. Copy your `.env` file into the project root (so the agent can read credentials).
+5. Run the agent:
+
+```bash
+# Start fresh
+python agent_gemini.py --project-dir /path/to/project
+
+# Continue on the current branch (useful specifically when adding more tasks to an existing PR)
+python agent_gemini.py --project-dir /path/to/project --continue-on-branch
+```
 
 ---
 
