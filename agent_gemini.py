@@ -25,6 +25,8 @@ from dotenv import load_dotenv
 parser = argparse.ArgumentParser(description='🌙 Night Shift Agent - Autonomous Coding Assistant')
 parser.add_argument('--project-dir', '-p', type=str, default='.', 
                     help='Path to the project directory (default: current directory)')
+parser.add_argument('--continue-on-branch', '-c', action='store_true',
+                    help='Continue using the current git branch instead of creating a new one')
 args = parser.parse_args()
 
 # Change to project directory
@@ -257,6 +259,17 @@ def find_existing_open_pr() -> tuple[str, str]:
     return "", ""
 
 def create_feature_branch() -> str:
+    # Check if we should continue on current branch
+    if args.continue_on_branch:
+        success, output = run_cmd("git rev-parse --abbrev-ref HEAD")
+        if success:
+            branch_name = output.strip()
+            logger.info(f"🌿 Continuing on current branch: {branch_name}")
+            return branch_name
+        else:
+            logger.error("❌ Failed to get current branch name")
+            sys.exit(1)
+
     # Check for existing open PR first
     existing_branch, existing_pr = find_existing_open_pr()
     if existing_branch:
