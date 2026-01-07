@@ -377,7 +377,7 @@ FILES:
 
 RULES:
 1. Create/modify Kotlin source files only
-2. After code changes, run './gradlew assembleDebug detekt' (NOT 'build')
+2. After code changes, run './gradlew assembleDebug :composeApp:linkDebugFrameworkIosSimulatorArm64 detekt' (NOT 'build') - this verifies BOTH Android and iOS
 3. If build fails, fix YOUR CODE (not build files)
 4. Commit when build passes
 5. NEVER modify build.gradle.kts or settings.gradle.kts
@@ -436,7 +436,7 @@ AVAILABLE TOOLS:
         if build_state.is_verified():
             logger.info("✅ Build verified")
             return True
-        full_history += "\n\nUSER: System: Run 'run_shell(\"./gradlew assembleDebug detekt\")' to verify."
+        full_history += "\n\nUSER: System: Run 'run_shell(\"./gradlew assembleDebug :composeApp:linkDebugFrameworkIosSimulatorArm64 detekt\")' to verify."
     return False
 
 def fix_ci_failure(branch_name: str, arch: str, files: str) -> bool:
@@ -452,7 +452,7 @@ Logs:
 TOOL USAGE: OUTPUT JSON {{ "tool": "name", "args": {{...}} }}
 TOOLS: read_file, write_file, list_files, run_shell
 
-Fix code (not build files), then run './gradlew assembleDebug detekt'.
+Fix code (not build files), then run './gradlew assembleDebug :composeApp:linkDebugFrameworkIosSimulatorArm64 detekt' to verify BOTH Android and iOS.
 """
     full_history = current_prompt
 
@@ -484,7 +484,7 @@ Fix code (not build files), then run './gradlew assembleDebug detekt'.
             continue  # Continue to next iteration after processing tool calls
             
         if build_state.is_verified(): return True
-        full_history += "\n\nUSER: Run './gradlew assembleDebug detekt'."
+        full_history += "\n\nUSER: Run './gradlew assembleDebug :composeApp:linkDebugFrameworkIosSimulatorArm64 detekt'."
     return False
 
 # =============================================================================
