@@ -79,11 +79,46 @@ class BuildState:
         self.build_attempted = False
         self.build_passed = False
         self.last_error = None
-    def reset(self): self.__init__()
+        self.last_successful_files = {}  # path -> content snapshot after last good build
+        self.files_changed_since_success = []  # track what changed since last success
+    def reset(self): 
+        self.build_attempted = False
+        self.build_passed = False
+        self.last_error = None
+        # Keep snapshots across task boundaries for debugging
     def is_verified(self) -> bool:
         return self.build_attempted and self.build_passed if REQUIRE_BUILD_VERIFICATION else True
+    def checkpoint(self, files_written: list):
+        """Snapshot file contents after successful build."""
+        for path in files_written:
+            try:
+                with open(path, 'r') as f:
+                    self.last_successful_files[path] = f.read()
+            except: pass
+        self.files_changed_since_success = []
+        logger.info(f"📸 Checkpoint saved: {len(self.last_successful_files)} files in known-good state")
 
 build_state = BuildState()
+
+# Rate limiting for command spam prevention
+class CommandRateLimiter:
+    def __init__(self, window_seconds=30, max_identical=3):
+        self.recent_commands = []  # (timestamp, command)
+        self.window = window_seconds
+        self.max_identical = max_identical
+    
+    def should_allow(self, command: str) -> tuple[bool, str]:
+        current_time = time.time()
+        # Clean old entries
+        self.recent_commands = [(t, c) for t, c in self.recent_commands if current_time - t < self.window]
+        # Count identical commands in window
+        identical_count = sum(1 for _, c in self.recent_commands if c == command)
+        if identical_count >= self.max_identical:
+            return False, f"Rate limited: same command executed {identical_count} times in {self.window}s"
+        self.recent_commands.append((current_time, command))
+        return True, ""
+
+rate_limiter = CommandRateLimiter()
 
 # =============================================================================
 # TOOLS
@@ -104,9 +139,39 @@ def write_file(path: str, content: str) -> str:
         logger.warning(f"🛡️ BLOCKED: {path}")
         return f"ERROR: {filename} is protected. Fix source code instead."
     try:
+        # Read existing content for diff logging
+        old_content = ""
+        if os.path.exists(path):
+            try:
+                with open(path, "r") as f:
+                    old_content = f.read()
+            except: pass
+        
         os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
         with open(path, "w") as f: f.write(content)
         logger.info(f"✍️ Wrote file: {path} ({len(content)} bytes)")
+        
+        # Log what changed (compact diff summary)
+        if old_content:
+            old_lines = old_content.splitlines()
+            new_lines = content.splitlines()
+            added = len(new_lines) - len(old_lines)
+            change_desc = f"+{added} lines" if added > 0 else f"{added} lines" if added < 0 else "same line count"
+            logger.info(f"   📝 Change: {change_desc}, was {len(old_content)}B -> now {len(content)}B")
+            # Log first few changed lines for debugging
+            import difflib
+            diff = list(difflib.unified_diff(old_lines[:50], new_lines[:50], lineterm='', n=0))
+            if diff:
+                # Only log first 5 diff lines to keep logs manageable
+                for line in diff[2:7]:  # Skip the --- +++ headers
+                    logger.info(f"   {line[:100]}{'...' if len(line) > 100 else ''}")
+                if len(diff) > 7:
+                    logger.info(f"   ... and {len(diff) - 7} more diff lines")
+        else:
+            logger.info(f"   📝 New file created")
+        
+        # Track what we've changed since last successful build
+        build_state.files_changed_since_success.append(path)
         build_state.build_passed = False
         build_state.build_attempted = False
         return f"Successfully wrote to {path}"
@@ -128,6 +193,13 @@ def list_files(path: str = ".") -> str:
 
 def run_shell(command: str) -> str:
     global build_state
+    
+    # Rate limiting check
+    allowed, reason = rate_limiter.should_allow(command)
+    if not allowed:
+        logger.warning(f"🚫 {reason}")
+        return f"Error: {reason}. Try a different approach or read error logs first."
+    
     logger.info(f"🤖 Executing: {command}")
     try:
         env = os.environ.copy()
@@ -136,11 +208,27 @@ def run_shell(command: str) -> str:
             env["GH_TOKEN"] = GH_BOT_TOKEN
         result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=600, env=env)
         output = result.stdout + result.stderr
-        if any(kw in command.lower() for kw in ["gradlew", "gradle", "build", "compile", "assemble"]):
+        is_build_command = any(kw in command.lower() for kw in ["gradlew", "gradle", "build", "compile", "assemble"])
+        
+        if is_build_command:
             build_state.build_attempted = True
             build_state.build_passed = result.returncode == 0
-            if result.returncode == 0: logger.info("✅ Command succeeded")
-            else: logger.warning(f"⚠️ Command failed (exit {result.returncode})")
+            if result.returncode == 0:
+                logger.info("✅ Command succeeded")
+                # Checkpoint: save state of files changed since last success
+                if build_state.files_changed_since_success:
+                    logger.info(f"📸 Build passed after changing: {build_state.files_changed_since_success}")
+                    build_state.checkpoint(build_state.files_changed_since_success)
+            else:
+                logger.warning(f"⚠️ Command failed (exit {result.returncode})")
+                # Log what we changed that might have broken it
+                if build_state.files_changed_since_success:
+                    logger.warning(f"   ⚠️ Files changed since last success: {build_state.files_changed_since_success}")
+                    # Log what we could revert to
+                    revertable = [p for p in build_state.files_changed_since_success if p in build_state.last_successful_files]
+                    if revertable:
+                        logger.info(f"   💡 Could revert to checkpoint: {revertable}")
+        
         if result.returncode != 0:
             return f"Command failed (exit {result.returncode}):\n{output}"
         return output
@@ -410,6 +498,9 @@ AVAILABLE TOOLS:
 """
     full_history = system_prompt + f"\n\nTASK: {task}\n"
     
+    consecutive_failures = 0
+    MAX_CONSECUTIVE_FAILURES = 5
+    
     for iteration in range(MAX_ITERATIONS):
         logger.info(f"🔄 Iteration {iteration + 1}/{MAX_ITERATIONS}")
         
@@ -443,6 +534,34 @@ AVAILABLE TOOLS:
                     pass # Not a valid tool call JSON
         
         if tool_calls_executed > 0:
+            # Track consecutive build failures
+            if build_state.build_attempted and not build_state.build_passed:
+                consecutive_failures += 1
+                logger.warning(f"   ⚠️ Consecutive build failures: {consecutive_failures}/{MAX_CONSECUTIVE_FAILURES}")
+                
+                # Auto-revert after too many consecutive failures
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES and build_state.last_successful_files:
+                    logger.warning(f"🔄 AUTO-REVERT: {consecutive_failures} consecutive failures, restoring checkpoint...")
+                    reverted_files = []
+                    for path, content in build_state.last_successful_files.items():
+                        if path in build_state.files_changed_since_success:
+                            try:
+                                with open(path, 'w') as f:
+                                    f.write(content)
+                                reverted_files.append(path)
+                                logger.info(f"   ↩️ Reverted: {path}")
+                            except Exception as e:
+                                logger.error(f"   ❌ Failed to revert {path}: {e}")
+                    
+                    build_state.files_changed_since_success = []
+                    consecutive_failures = 0
+                    
+                    if reverted_files:
+                        full_history += f"\n\nSYSTEM: Auto-reverted {len(reverted_files)} files to last working state due to repeated failures. Files: {reverted_files}. Try a simpler approach."
+                        logger.info(f"📸 Reverted {len(reverted_files)} files to checkpoint. Agent notified to try simpler approach.")
+            elif build_state.build_attempted and build_state.build_passed:
+                consecutive_failures = 0  # Reset on success
+            
             continue  # Continue to next iteration after processing tool calls
 
         logger.info(f"\n🧠 Agent Report:\n{response_text}")
@@ -543,7 +662,7 @@ def main():
                 current_task = stripped
                 break
         if task_index == -1:
-            logger.info("✅ All tasks completed!")
+            logger.info("📋 No more tasks to process")
             break
         
         logger.info(f"\n{'='*60}")
@@ -562,10 +681,18 @@ def main():
     
     with open("tasks.txt", "r") as f: final_lines = f.readlines()
     tasks_succeeded = sum(1 for l in final_lines if l.startswith("[x]"))
+    tasks_failed = sum(1 for l in final_lines if l.startswith("[!]"))
     completed = [l.replace("[x]", "").strip() for l in final_lines if l.startswith("[x]")]
+    failed = [l.replace("[!]", "").strip() for l in final_lines if l.startswith("[!]")]
+    
+    # Log accurate task summary
+    if tasks_failed > 0:
+        logger.warning(f"⚠️ Task Summary: {tasks_succeeded} succeeded, {tasks_failed} failed")
+    else:
+        logger.info(f"✅ All {tasks_succeeded} tasks completed successfully!")
     
     if tasks_succeeded == 0:
-        logger.warning("⚠️ No tasks completed. Skipping PR.")
+        logger.warning("⚠️ No tasks completed successfully. Skipping PR.")
         run_cmd("git checkout main")
         return
     
@@ -590,8 +717,10 @@ def main():
         logger.error("❌ Failed to push")
         return
     
-    pr_title = f"🌙 Night Shift: {tasks_succeeded} task(s)"
-    pr_body = f"## 🌙 Night Shift Agent Report\n\n**Tasks**: {tasks_succeeded}\n\n" + "\n".join([f"- [x] {t}" for t in completed])
+    pr_title = f"🌙 Night Shift: {tasks_succeeded} task(s)" + (f" ({tasks_failed} failed)" if tasks_failed > 0 else "")
+    pr_body = f"## 🌙 Night Shift Agent Report\n\n**Succeeded**: {tasks_succeeded}\n**Failed**: {tasks_failed}\n\n### ✅ Completed\n" + "\n".join([f"- [x] {t}" for t in completed])
+    if failed:
+        pr_body += "\n\n### ❌ Failed\n" + "\n".join([f"- [ ] {t}" for t in failed])
     
     pr_success, pr_url = create_pull_request(feature_branch, pr_title, pr_body)
     if not pr_success:
@@ -644,7 +773,9 @@ def main():
     logger.info("\n" + "="*60)
     logger.info("📊 FINAL SESSION SUMMARY")
     logger.info("="*60)
-    logger.info(f"   Tasks processed: {tasks_succeeded}")
+    logger.info(f"   Tasks succeeded: {tasks_succeeded}")
+    if tasks_failed > 0:
+        logger.warning(f"   Tasks failed: {tasks_failed}")
     logger.info(f"   PR URL: {pr_url}")
     
     if ci_passed:

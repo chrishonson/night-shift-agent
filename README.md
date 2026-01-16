@@ -145,7 +145,53 @@ Session logs are saved to `.agent_logs/` in the project directory:
 
 ---
 
-## 🔧 Project Integration
+## �️ Reliability Features
+
+The agent includes several safeguards to prevent runaway failures:
+
+### Checkpoints & Auto-Revert
+
+After each **successful build**, the agent saves a snapshot of all modified files. If the agent encounters **5 consecutive build failures**, it will:
+
+1. Automatically revert all changed files to the last known-good checkpoint
+2. Notify itself to "try a simpler approach"
+3. Reset the failure counter and continue
+
+This prevents the agent from spiraling into an infinite loop of failed attempts.
+
+**Log example:**
+```
+⚠️ Consecutive build failures: 5/5
+🔄 AUTO-REVERT: 5 consecutive failures, restoring checkpoint...
+   ↩️ Reverted: ChatService.kt
+   ↩️ Reverted: App.kt
+📸 Reverted 2 files to checkpoint. Agent notified to try simpler approach.
+```
+
+### Rate Limiting
+
+To prevent command spam (e.g., retrying the same failing build 40+ times), the agent enforces rate limits:
+
+- **Same command limit**: Max 3 identical commands within 30 seconds
+- When rate-limited, the agent is told to read error logs and try a different approach
+
+### Enhanced Diff Logging
+
+Every file write now logs a compact diff showing what changed:
+
+```
+✍️ Wrote file: ChatService.kt (1898 bytes)
+   📝 Change: +15 lines, was 1447B -> now 1898B
+   +import some.new.package
+   -old_function()
+   +new_function()
+```
+
+This makes it easy to identify exactly what change broke a build when reviewing logs.
+
+---
+
+## �🔧 Project Integration
 
 ### For Kotlin Multiplatform Projects
 
@@ -172,6 +218,58 @@ python agent_gemini.py --project-dir /path/to/project
 # Continue on the current branch (useful specifically when adding more tasks to an existing PR)
 python agent_gemini.py --project-dir /path/to/project --continue-on-branch
 ```
+
+---
+
+## 🏃 Self-Hosted Runner Setup
+
+If your project includes UI tests that run on a self-hosted runner (like `connectedAndroidTest`), you'll need to configure your local machine as a GitHub Actions runner for each new repository.
+
+### First-Time Setup
+
+If you've never set up a runner, follow the complete setup in your project's `docs/RUNNER_SETUP.md`.
+
+### Switching to a New Repository
+
+If you already have a runner configured for a different repo and need to switch:
+
+```bash
+# 1. Stop the current runner service
+cd ~/actions-runner
+sudo ./svc.sh stop
+
+# 2. Remove the old configuration
+./config.sh remove
+
+# 3. Get a new token from GitHub:
+#    Go to: GitHub → YOUR_NEW_REPO → Settings → Actions → Runners → New self-hosted runner
+#    Copy the registration token shown
+
+# 4. Configure for the new repo
+./config.sh --url https://github.com/OWNER/NEW_REPO --token YOUR_NEW_TOKEN
+
+# 5. Restart the service
+sudo ./svc.sh start
+
+# 6. Verify it's running
+sudo ./svc.sh status
+```
+
+### Running Multiple Repos (Organization Runner)
+
+Instead of switching per-repo, you can register a runner at the **organization level**:
+
+1. Go to: `github.com/organizations/YOUR_ORG/settings/actions/runners`
+2. Add a new runner at org level
+3. The runner will be available to all repos in that org
+
+### Troubleshooting
+
+| Issue | Solution |
+|-------|----------|
+| Job stuck in "Queued" | Runner not running or configured for different repo |
+| "Runner offline" in GitHub | Run `sudo ./svc.sh start` in `~/actions-runner` |
+| Permission denied | Ensure runner user has access to Android SDK / emulator |
 
 ---
 
