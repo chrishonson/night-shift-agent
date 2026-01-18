@@ -344,6 +344,10 @@ available_functions = {
     "replace": replace_in_file
 }
 
+class QuotaExceededError(Exception):
+    """Exception raised when an LLM provider hits a rate limit or quota."""
+    pass
+
 def strip_markdown_code_blocks(text: str) -> str:
     """Strip markdown code block wrappers from text."""
     text = text.strip()
@@ -376,6 +380,12 @@ def call_gemini_cli(prompt: str):
             # Debug: log raw output
             logger.debug(f"   📤 Gemini stdout length: {len(result.stdout)}")
             logger.debug(f"   📤 Gemini stderr: {result.stderr[:200] if result.stderr else 'none'}")
+
+            # Check for Quota/Rate Limit Errors in stdout/stderr
+            combined_output = (result.stdout + result.stderr).lower()
+            if "quota exceeded" in combined_output or "resource exhausted" in combined_output or "429" in combined_output:
+                logger.error("🚨 Gemini Quota Exceeded!")
+                raise QuotaExceededError("Gemini Quota Exceeded")
             
             if result.returncode != 0:
                 logger.warning(f"⚠️ CLI Error (Attempt {attempt+1}/{MAX_RETRIES}): {result.stderr}")
@@ -392,6 +402,8 @@ def call_gemini_cli(prompt: str):
             return response_text
 
 
+        except QuotaExceededError:
+            raise
         except Exception as e:
             logger.warning(f"⚠️ CLI Exception (Attempt {attempt+1}/{MAX_RETRIES}): {e}")
             if attempt < MAX_RETRIES - 1:
@@ -426,6 +438,12 @@ def call_claude_cli(prompt: str):
                 )
                 
                 if result.returncode != 0:
+                    # Check for Quota/Rate Limit in stdout/stderr (Claude prints to stdout usually)
+                    combined_output = (result.stdout + result.stderr).lower()
+                    if "hit your limit" in combined_output or "rate limit" in combined_output:
+                         logger.error("🚨 Claude Quota Exceeded!")
+                         raise QuotaExceededError("Claude Quota Exceeded")
+
                     logger.warning(f"⚠️ CLI Error (Attempt {attempt+1}/{MAX_RETRIES}): {result.stderr}")
                     if attempt < MAX_RETRIES - 1:
                         time.sleep(RETRY_BASE_DELAY * (2 ** attempt))
@@ -443,6 +461,8 @@ def call_claude_cli(prompt: str):
                 if os.path.exists(temp_prompt_path):
                     os.unlink(temp_prompt_path)
 
+        except QuotaExceededError:
+            raise
         except Exception as e:
             logger.warning(f"⚠️ CLI Exception (Attempt {attempt+1}/{MAX_RETRIES}): {e}")
             if attempt < MAX_RETRIES - 1:
@@ -452,11 +472,37 @@ def call_claude_cli(prompt: str):
     return None
 
 def call_llm_cli(prompt: str):
-    """Route to the appropriate CLI based on AGENT_PROVIDER"""
-    if AGENT_PROVIDER == "claude":
-        return call_claude_cli(prompt)
-    else:
-        return call_gemini_cli(prompt)
+    """Route to the appropriate CLI based on AGENT_PROVIDER, with auto-failover on quota limits."""
+    global AGENT_PROVIDER, AGENT_MODEL
+
+    # Store original provider to prevent infinite failover loops in one call if both fail
+    original_provider = AGENT_PROVIDER
+
+    while True:
+        try:
+            if AGENT_PROVIDER == "claude":
+                return call_claude_cli(prompt)
+            else:
+                return call_gemini_cli(prompt)
+        except QuotaExceededError:
+            logger.warning(f"🛑 {AGENT_PROVIDER.title()} Quota Exceeded. Attempting to switch providers...")
+            
+            # Switch Provider
+            if AGENT_PROVIDER == "claude":
+                AGENT_PROVIDER = "gemini"
+                AGENT_MODEL = "gemini-2.5-flash"
+            else:
+                AGENT_PROVIDER = "claude"
+                AGENT_MODEL = "" # Default for Claude CLI
+
+            # Detect if we cycled back to original provider (both failed)
+            if AGENT_PROVIDER == original_provider:
+                 logger.error("❌ Both providers have exceeded their quotas! Stopping.")
+                 return None
+            
+            logger.info(f"🔄 Switched to {AGENT_PROVIDER.title()} (Model: {AGENT_MODEL or 'Default'}). Retrying...")
+            # Loop continues and tries new provider
+
 
 
 # =============================================================================
