@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-🌙 Night Shift Agent v3.2 - Autonomous Coding Assistant
+🌙 Night Shift Agent v3.6 - Autonomous Coding Assistant
 ========================================================
 Features:
 - Direct push to origin (enables UI tests on PRs)
@@ -13,6 +13,7 @@ Features:
 import os
 import subprocess
 import sys
+import re
 import time
 import json
 import logging
@@ -44,17 +45,19 @@ load_dotenv()  # Also load from agent's directory as fallback
 # CONFIGURATION
 # =============================================================================
 
-MODEL_NAME = os.getenv("AGENT_MODEL", "gemini-3-flash-preview")
+AGENT_PROVIDER = os.getenv("PREFERRED_AGENT_PROVIDER", "claude")  # "gemini" or "claude"
+AGENT_MODEL = os.getenv("PREFERRED_AGENT_MODEL", "sonnet")  # gemini model or claude alias (sonnet, opus)
 GH_BOT_TOKEN = os.getenv("GH_BOT_TOKEN")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "agentnightshift")
 
 MAX_ITERATIONS = 50
-MAX_RETRIES = 3
+MAX_RETRIES = 5
 MAX_CI_FIX_ATTEMPTS = 5
-RETRY_BASE_DELAY = 2
+RETRY_BASE_DELAY = 5
 CI_POLL_INTERVAL = 60
-MAX_FILES_IN_CONTEXT = 100
+MAX_FILES_IN_CONTEXT = 50
 REQUIRE_BUILD_VERIFICATION = True
+MAX_CONTEXT_CHARS = 30000  # Conservative limit for CLI/shell reliability
 
 BRANCH_PREFIX = "nightshift"
 
@@ -65,8 +68,8 @@ LOG_DIR.mkdir(exist_ok=True)
 LOG_FILE = LOG_DIR / f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s %(message)s',
+    level=logging.DEBUG,  # Changed to DEBUG for troubleshooting
+    format='%(asctime)s %(levelname)s %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S',
     handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler(sys.stdout)]
 )
@@ -124,40 +127,47 @@ rate_limiter = CommandRateLimiter()
 # TOOLS
 # =============================================================================
 
-def read_file(path: str) -> str:
+def read_file(path: str = None, file_path: str = None) -> str:
+    target_path = path or file_path
+    if not target_path: return "Error: No path provided"
     try:
-        with open(path, "r") as f: content = f.read()
-        logger.info(f"📖 Read file: {path} ({len(content)} bytes)")
+        with open(target_path, "r") as f: content = f.read()
+        logger.info(f"📖 Read file: {target_path} ({len(content)} bytes)")
         return content
     except Exception as e:
-        logger.error(f"❌ Failed to read {path}: {e}")
-        return f"Error reading file {path}: {e}"
+        logger.error(f"❌ Failed to read {target_path}: {e}")
+        return f"Error reading file {target_path}: {e}"
 
-def write_file(path: str, content: str) -> str:
-    filename = os.path.basename(path)
+def write_file(path: str = None, content: str = None, file_path: str = None, code: str = None, file_content: str = None) -> str:
+    target_path = path or file_path
+    target_content = content or code or file_content or ""
+    
+    if not target_path: return "Error: No path provided"
+    
+    filename = os.path.basename(target_path)
     if filename in PROTECTED_FILES:
-        logger.warning(f"🛡️ BLOCKED: {path}")
+        logger.warning(f"🛡️ BLOCKED: {target_path}")
         return f"ERROR: {filename} is protected. Fix source code instead."
     try:
         # Read existing content for diff logging
         old_content = ""
-        if os.path.exists(path):
+        if os.path.exists(target_path):
             try:
-                with open(path, "r") as f:
+                with open(target_path, "r") as f:
                     old_content = f.read()
             except: pass
         
-        os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
-        with open(path, "w") as f: f.write(content)
-        logger.info(f"✍️ Wrote file: {path} ({len(content)} bytes)")
+        os.makedirs(os.path.dirname(target_path) if os.path.dirname(target_path) else ".", exist_ok=True)
+        with open(target_path, "w") as f: f.write(target_content)
+        logger.info(f"✍️ Wrote file: {target_path} ({len(target_content)} bytes)")
         
         # Log what changed (compact diff summary)
         if old_content:
             old_lines = old_content.splitlines()
-            new_lines = content.splitlines()
+            new_lines = target_content.splitlines()
             added = len(new_lines) - len(old_lines)
             change_desc = f"+{added} lines" if added > 0 else f"{added} lines" if added < 0 else "same line count"
-            logger.info(f"   📝 Change: {change_desc}, was {len(old_content)}B -> now {len(content)}B")
+            logger.info(f"   📝 Change: {change_desc}, was {len(old_content)}B -> now {len(target_content)}B")
             # Log first few changed lines for debugging
             import difflib
             diff = list(difflib.unified_diff(old_lines[:50], new_lines[:50], lineterm='', n=0))
@@ -171,13 +181,13 @@ def write_file(path: str, content: str) -> str:
             logger.info(f"   📝 New file created")
         
         # Track what we've changed since last successful build
-        build_state.files_changed_since_success.append(path)
+        build_state.files_changed_since_success.append(target_path)
         build_state.build_passed = False
         build_state.build_attempted = False
-        return f"Successfully wrote to {path}"
+        return f"Successfully wrote to {target_path}"
     except Exception as e:
-        logger.error(f"❌ Failed to write {path}: {e}")
-        return f"Error writing to file {path}: {e}"
+        logger.error(f"❌ Failed to write {target_path}: {e}")
+        return f"Error writing to file {target_path}: {e}"
 
 def list_files(path: str = ".") -> str:
     files = []
@@ -208,7 +218,8 @@ def run_shell(command: str) -> str:
             env["GH_TOKEN"] = GH_BOT_TOKEN
         result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=600, env=env)
         output = result.stdout + result.stderr
-        is_build_command = any(kw in command.lower() for kw in ["gradlew", "gradle", "build", "compile", "assemble"])
+        # Only treat as build command if it's actually running gradlew/gradle
+        is_build_command = command.strip().startswith("./gradlew") or command.strip().startswith("gradlew") or command.strip().startswith("gradle ")
         
         if is_build_command:
             build_state.build_attempted = True
@@ -238,8 +249,20 @@ def run_shell(command: str) -> str:
 # Tools list removed - handled by system prompt
 
 def extract_json_objects(text: str) -> list:
-    """Extract all valid JSON objects from a string by tracking brace depth."""
+    """Extract JSON objects, prioritizing <agent_action> tags."""
     objects = []
+    
+    # Strategy 1: Look for <agent_action> tags (Best for Gemini CLI)
+    matches = re.findall(r'<agent_action>(.*?)</agent_action>', text, re.DOTALL)
+    for match in matches:
+        try:
+            # Clean up potential markdown code blocks inside tags
+            clean_json = strip_markdown_code_blocks(match.strip())
+            return [clean_json] # Return immediately if found
+        except:
+            pass
+            
+    # Strategy 2: Fallback to finding raw JSON objects (Legacy/Claude)
     i = 0
     while i < len(text):
         if text[i] == '{':
@@ -261,33 +284,114 @@ def extract_json_objects(text: str) -> list:
                     elif char == '}':
                         depth -= 1
                         if depth == 0:
-                            objects.append(text[start:i+1])
+                            json_candidate = text[start:i+1]
+                            # Validate it's actually valid JSON
+                            try:
+                                json.loads(json_candidate)
+                                objects.append(json_candidate)
+                            except json.JSONDecodeError:
+                                logger.debug(f"   🔍 Invalid JSON candidate (len={len(json_candidate)}): {json_candidate[:100]}...")
                             break
                 i += 1
         i += 1
+    if objects:
+        logger.debug(f"   🔍 Extracted {len(objects)} JSON object(s) from response")
     return objects
 
-available_functions = {"read_file": read_file, "write_file": write_file, "list_files": list_files, "run_shell": run_shell}
+def search_file_content(pattern, dir_path=".", include=None):
+    cmd = f"grep -r '{pattern}' {dir_path}"
+    if include:
+        cmd += f" --include='{include}'"
+    return run_shell(cmd)
+
+def replace_in_file(path: str = None, file_path: str = None, old_string: str = None, new_string: str = None, instruction: str = None, **kwargs) -> str:
+    """Replace text in a file (Gemini CLI's 'replace' tool)."""
+    target_path = path or file_path
+    if not target_path:
+        return "Error: No file_path (or path) provided"
+    if not old_string or new_string is None:
+        return "Error: old_string and new_string are required"
+    
+    try:
+        with open(target_path, "r") as f:
+            content = f.read()
+            
+        if new_string in content:
+            return f"Success: Text already present in {target_path}"
+        
+        if old_string not in content:
+            return f"Error: Could not find the specified text in {target_path}"
+        
+        new_content = content.replace(old_string, new_string, 1)
+        with open(target_path, "w") as f:
+            f.write(new_content)
+        
+        logger.info(f"✏️ Replaced text in: {target_path}")
+        build_state.files_changed_since_success.append(target_path)
+        build_state.build_passed = False
+        build_state.build_attempted = False
+        return f"Successfully replaced text in {target_path}"
+    except Exception as e:
+        return f"Error replacing in {target_path}: {e}"
+
+available_functions = {
+    "read_file": read_file, 
+    "write_file": write_file, 
+    "list_files": list_files, 
+    "run_shell": run_shell,
+    "run_shell_command": run_shell,
+    "search_file_content": search_file_content,
+    "replace": replace_in_file
+}
+
+def strip_markdown_code_blocks(text: str) -> str:
+    """Strip markdown code block wrappers from text."""
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.split('\n')
+        # Remove opening ``` or ```json
+        if lines[0].startswith("```"):
+            lines = lines[1:]
+        # Remove closing ```
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        return '\n'.join(lines).strip()
+    return text
 
 def call_gemini_cli(prompt: str):
+    """Call Gemini CLI"""
     logger.info("🤖 Calling Gemini CLI...")
     for attempt in range(MAX_RETRIES):
         try:
-            # Pushing prompt via stdin
+            # Let Gemini CLI execute in text mode (no --output-format json)
+            # This prevents it from intercepting tool calls
             result = subprocess.run(
-                ["gemini", "--model", MODEL_NAME, "--output-format", "text"],
+                ["gemini", "--model", AGENT_MODEL],
                 input=prompt,
                 capture_output=True,
                 text=True,
                 timeout=300
             )
+            
+            # Debug: log raw output
+            logger.debug(f"   📤 Gemini stdout length: {len(result.stdout)}")
+            logger.debug(f"   📤 Gemini stderr: {result.stderr[:200] if result.stderr else 'none'}")
+            
             if result.returncode != 0:
                 logger.warning(f"⚠️ CLI Error (Attempt {attempt+1}/{MAX_RETRIES}): {result.stderr}")
                 if attempt < MAX_RETRIES - 1:
                     time.sleep(RETRY_BASE_DELAY * (2 ** attempt))
                     continue
                 return None
-            return result.stdout.strip()
+
+            # Raw text output logic (no JSON wrapper)
+            response_text = result.stdout.strip()
+            # Strip markdown code blocks if present
+            response_text = strip_markdown_code_blocks(response_text)
+            logger.debug(f"   📥 Gemini response length: {len(response_text)}, starts with: {response_text[:100]}...")
+            return response_text
+
+
         except Exception as e:
             logger.warning(f"⚠️ CLI Exception (Attempt {attempt+1}/{MAX_RETRIES}): {e}")
             if attempt < MAX_RETRIES - 1:
@@ -295,6 +399,65 @@ def call_gemini_cli(prompt: str):
             else:
                 return None
     return None
+
+def call_claude_cli(prompt: str):
+    """Call Claude Code CLI in print mode (text only), relying on prompt for structure."""
+    logger.info(f"🤖 Calling Claude CLI... (Prompt length: {len(prompt)} chars)")
+    for attempt in range(MAX_RETRIES):
+        try:
+            # Write prompt to temp file
+            import tempfile
+            with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt') as f:
+                f.write(prompt)
+                temp_prompt_path = f.name
+            
+            try:
+                # No --json-schema or --output-format json -> Raw text output
+                model_arg = f"--model {AGENT_MODEL}" if AGENT_MODEL else ""
+                cmd = f"cat {temp_prompt_path} | claude -p {model_arg} --dangerously-skip-permissions"
+                logger.debug(f"   📤 Claude command: {cmd}")
+                
+                result = subprocess.run(
+                    cmd,
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=300
+                )
+                
+                if result.returncode != 0:
+                    logger.warning(f"⚠️ CLI Error (Attempt {attempt+1}/{MAX_RETRIES}): {result.stderr}")
+                    if attempt < MAX_RETRIES - 1:
+                        time.sleep(RETRY_BASE_DELAY * (2 ** attempt))
+                        continue
+                    return None
+
+                response_text = result.stdout.strip()
+                # Strip markdown code blocks if present (helper handles it)
+                response_text = strip_markdown_code_blocks(response_text)
+                
+                logger.debug(f"   📥 Claude response length: {len(response_text)}, starts with: {response_text[:100]}...")
+                return response_text
+                
+            finally:
+                if os.path.exists(temp_prompt_path):
+                    os.unlink(temp_prompt_path)
+
+        except Exception as e:
+            logger.warning(f"⚠️ CLI Exception (Attempt {attempt+1}/{MAX_RETRIES}): {e}")
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_BASE_DELAY * (2 ** attempt))
+            else:
+                return None
+    return None
+
+def call_llm_cli(prompt: str):
+    """Route to the appropriate CLI based on AGENT_PROVIDER"""
+    if AGENT_PROVIDER == "claude":
+        return call_claude_cli(prompt)
+    else:
+        return call_gemini_cli(prompt)
+
 
 # =============================================================================
 # GIT HELPERS
@@ -482,21 +645,33 @@ RULES:
 3. If build fails, fix YOUR CODE (not build files)
 4. Commit when build passes
 5. NEVER modify build.gradle.kts or settings.gradle.kts
+6. VERIFICATION: You explicitly CANNOT assume code works until you see 'run_shell' output "BUILD SUCCESSFUL". You MUST Run 'run_shell' to verify.
 
 TOOL USAGE FORMAT:
-To Use a tool, OUTPUT STRICT JSON ONLY:
-{{
-  "tool": "tool_name",
-  "args": {{ "arg1": "value" }}
-}}
+CRITICAL: You are a function-calling agent. You must NOT write conversational text.
+You must ONLY output valid JSON objects to request actions.
 
-AVAILABLE TOOLS:
+CRITICAL: You MUST wrap your JSON response in <agent_action> tags.
+Example:
+<agent_action>
+{{
+  "action": "write_file",
+  "args": {{ "path": "Main.kt", "content": "..." }}
+}}
+</agent_action>
+
+AVAILABLE ACTIONS:
 - read_file(path)
 - write_file(path, content)
+- replace(path, old_string, new_string)
 - list_files(path)
 - run_shell(command)
+
+IMPORTANT: Output a JSON object with the "action" key, wrapped in <agent_action> tags.
 """
-    full_history = system_prompt + f"\n\nTASK: {task}\n"
+    
+    base_prompt = system_prompt + f"\n\nTASK: {task}\n\nUSER: Start by searching or reading files. You must output a valid <agent_action>."
+    history_chunks = []
     
     consecutive_failures = 0
     MAX_CONSECUTIVE_FAILURES = 5
@@ -504,34 +679,58 @@ AVAILABLE TOOLS:
     for iteration in range(MAX_ITERATIONS):
         logger.info(f"🔄 Iteration {iteration + 1}/{MAX_ITERATIONS}")
         
-        response_text = call_gemini_cli(full_history)
+        # history pruning
+        current_history = "".join(history_chunks)
+        while len(history_chunks) > 2 and (len(base_prompt) + len(current_history)) > MAX_CONTEXT_CHARS:
+             # Keep the last few turns, drop the oldest
+             dropped = history_chunks.pop(0)
+             current_history = "".join(history_chunks)
+             logger.info(f"✂️ Pruned context: dropped {len(dropped)} chars")
+             
+        full_prompt = base_prompt + current_history
+
+        response_text = call_llm_cli(full_prompt)
         if not response_text:
-            logger.error("❌ No response from Gemini CLI")
+            logger.error(f"❌ No response from {AGENT_PROVIDER} CLI")
             return False
             
-        full_history += f"\n\nASSISTANT: {response_text}"
+        current_turn = f"\n\nASSISTANT: {response_text}"
         
         # Parse for JSON format tool calls - handle multiple JSON blocks
         tool_calls_executed = 0
         if "{" in response_text and "}" in response_text:
             # Extract all JSON objects from the response
             json_objects = extract_json_objects(response_text)
+            logger.debug(f"   🔍 Found {len(json_objects)} JSON objects in response")
             for json_str in json_objects:
                 try:
                     data = json.loads(json_str)
-                    if "tool" in data and "args" in data:
-                        tool_name = data["tool"]
-                        args = data["args"]
+                    # Support 'action' (standard) or 'tool' (legacy) keys
+                    tool_name = data.get("action") or data.get("tool")
+                    args = data.get("args", {})
+                    
+                    if tool_name:
+                        # Standardize args (file_path -> path, file_content -> content)
+                        if "path" not in args and "file_path" in args:
+                            args["path"] = args.pop("file_path")
+                        if "content" not in args and "file_content" in args:
+                            args["content"] = args.pop("file_content")
+                            
                         logger.info(f"🛠️ Tool Call: {tool_name}")
+                        logger.debug(f"   🛠️ Args: {str(args)[:200]}...")
                         
                         func = available_functions.get(tool_name)
                         if func:
                             resp = func(**args)
-                            if len(str(resp)) > 10000: resp = str(resp)[:5000] + "...[truncated]..." + str(resp)[-5000:]
-                            full_history += f"\n\nTOOL OUTPUT ({tool_name}): {str(resp)}"
+                            if len(str(resp)) > 2000: resp = str(resp)[:1000] + f"...[truncated {len(str(resp))-2000} chars]..." + str(resp)[-1000:]
+                            current_turn += f"\n\nTOOL OUTPUT ({tool_name}): {str(resp)}"
                             tool_calls_executed += 1
-                except:
-                    pass # Not a valid tool call JSON
+                        else:
+                            logger.warning(f"   ⚠️ Unknown tool: {tool_name}")
+                    else:
+                        logger.debug(f"   🔍 JSON object missing 'tool' or 'args': {list(data.keys())}")
+                except Exception as e:
+                    logger.debug(f"   🔍 Failed to parse JSON object: {e}, content: {json_str[:100]}...")
         
         if tool_calls_executed > 0:
             # Track consecutive build failures
@@ -557,18 +756,31 @@ AVAILABLE TOOLS:
                     consecutive_failures = 0
                     
                     if reverted_files:
-                        full_history += f"\n\nSYSTEM: Auto-reverted {len(reverted_files)} files to last working state due to repeated failures. Files: {reverted_files}. Try a simpler approach."
+                        current_turn += f"\n\nSYSTEM: Auto-reverted {len(reverted_files)} files to last working state due to repeated failures. Files: {reverted_files}. Try a simpler approach."
                         logger.info(f"📸 Reverted {len(reverted_files)} files to checkpoint. Agent notified to try simpler approach.")
             elif build_state.build_attempted and build_state.build_passed:
                 consecutive_failures = 0  # Reset on success
             
+            if build_state.is_verified():
+                logger.info("✅ Build verified (triggered by tool execution)")
+                return True
+            else:
+                # Tool ran, but didn't verify. Warn the agent to run the actual build command.
+                current_turn += "\n\nSYSTEM: You executed a tool, but the build is NOT verified. To complete the task, you MUST run the verification command: ./gradlew assembleDebug :composeApp:linkDebugFrameworkIosSimulatorArm64 detekt"
+
+            history_chunks.append(current_turn)
             continue  # Continue to next iteration after processing tool calls
+        else:
+            # No tool calls detected - prompt the agent to act
+            logger.warning("⚠️ No tool calls detected in response")
+            current_turn += "\n\nSYSTEM: ERROR: No tool execution detected. You have NOT verified the build in this session. You MUST output a JSON tool call to run: ./gradlew assembleDebug :composeApp:linkDebugFrameworkIosSimulatorArm64 detekt"
 
         logger.info(f"\n🧠 Agent Report:\n{response_text}")
         if build_state.is_verified():
             logger.info("✅ Build verified")
             return True
-        full_history += "\n\nUSER: System: Run 'run_shell(\"./gradlew assembleDebug :composeApp:linkDebugFrameworkIosSimulatorArm64 detekt\")' to verify."
+        current_turn += "\n\nUSER: System: Run 'run_shell(\"./gradlew assembleDebug :composeApp:linkDebugFrameworkIosSimulatorArm64 detekt\")' to verify."
+        history_chunks.append(current_turn)
     return False
 
 def fix_ci_failure(branch_name: str, arch: str, files: str) -> bool:
@@ -576,7 +788,7 @@ def fix_ci_failure(branch_name: str, arch: str, files: str) -> bool:
     build_state.reset()
     logs = get_pr_check_logs(branch_name)
     
-    current_prompt = f"""You are Night Shift Agent.
+    base_prompt = f"""You are Night Shift Agent.
 CI Failed for branch {branch_name}.
 Logs:
 {logs}
@@ -586,13 +798,21 @@ TOOLS: read_file, write_file, list_files, run_shell
 
 Fix code (not build files), then run './gradlew assembleDebug :composeApp:linkDebugFrameworkIosSimulatorArm64 detekt' to verify BOTH Android and iOS.
 """
-    full_history = current_prompt
+    history_chunks = []
 
     for _ in range(MAX_ITERATIONS):
-        response_text = call_gemini_cli(full_history)
+        # history pruning
+        current_history = "".join(history_chunks)
+        while len(history_chunks) > 2 and (len(base_prompt) + len(current_history)) > MAX_CONTEXT_CHARS:
+             dropped = history_chunks.pop(0)
+             current_history = "".join(history_chunks)
+        
+        full_prompt = base_prompt + current_history
+        
+        response_text = call_llm_cli(full_prompt)
         if not response_text: return False
         
-        full_history += f"\n\nASSISTANT: {response_text}"
+        current_turn = f"\n\nASSISTANT: {response_text}"
         
         # Parse for JSON format tool calls - handle multiple JSON blocks
         tool_calls_executed = 0
@@ -608,15 +828,17 @@ Fix code (not build files), then run './gradlew assembleDebug :composeApp:linkDe
                         func = available_functions.get(tool_name)
                         if func:
                             resp = func(**tool_args)
-                            full_history += f"\n\nTOOL OUTPUT ({tool_name}): {str(resp)[:5000]}"
+                            current_turn += f"\n\nTOOL OUTPUT ({tool_name}): {str(resp)[:2000]}"
                             tool_calls_executed += 1
                 except: pass
         
         if tool_calls_executed > 0:
+            history_chunks.append(current_turn)
             continue  # Continue to next iteration after processing tool calls
             
         if build_state.is_verified(): return True
-        full_history += "\n\nUSER: Run './gradlew assembleDebug :composeApp:linkDebugFrameworkIosSimulatorArm64 detekt'."
+        current_turn += "\n\nUSER: Run './gradlew assembleDebug :composeApp:linkDebugFrameworkIosSimulatorArm64 detekt'."
+        history_chunks.append(current_turn)
     return False
 
 # =============================================================================
@@ -626,7 +848,7 @@ Fix code (not build files), then run './gradlew assembleDebug :composeApp:linkDe
 def main():
     logger.info("""
     ╔══════════════════════════════════════════════════════════════╗
-    ║  🌙 Night Shift Agent v3.2                                   ║
+    ║  🌙 Night Shift Agent v3.6                                   ║
     ║  Autonomous Coding Assistant with Direct Push Workflow       ║
     ╚══════════════════════════════════════════════════════════════╝
     """)
@@ -635,7 +857,7 @@ def main():
         logger.warning("⚠️ GH_BOT_TOKEN not set - git operations may fail")
     
     logger.info(f"📁 Project: {PROJECT_DIR}")
-    logger.info(f"🤖 Model: {MODEL_NAME}")
+    logger.info(f"🤖 Provider: {AGENT_PROVIDER}, Model: {AGENT_MODEL}")
     logger.info(f"📝 Log file: {LOG_FILE}")
     
     arch = read_file("ARCHITECTURE.md") if os.path.exists("ARCHITECTURE.md") else ""
@@ -703,8 +925,14 @@ def main():
     # Commit all changes
     logger.info("📝 Committing changes...")
     run_cmd("git add -A")
-    commit_msg = f"🌙 Night Shift: {', '.join(completed[:3])}{'...' if len(completed) > 3 else ''}"
-    success, output = run_cmd(f'git commit -m "{commit_msg}"')
+    # Sanitize task names for commit message (remove quotes, limit length)
+    def sanitize_task(t):
+        return t.replace('"', '').replace("'", "")[:50]
+    safe_tasks = [sanitize_task(t) for t in completed[:3]]
+    commit_msg = f"🌙 Night Shift: {', '.join(safe_tasks)}{'...' if len(completed) > 3 else ''}"
+    # Use single quotes for outer shell and escape any single quotes in message
+    escaped_msg = commit_msg.replace("'", "'\"'\"'")
+    success, output = run_cmd(f"git commit -m '{escaped_msg}'")
     if not success and "nothing to commit" in output:
         logger.warning("⚠️ No changes to commit")
     elif not success:
