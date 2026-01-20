@@ -2,12 +2,11 @@
 """
 🌙 Night Shift Agent v3.6 - Autonomous Coding Assistant
 ========================================================
-Features:
-- Direct push to origin (enables UI tests on PRs)
-- Build verification before task completion
-- CI monitoring with automatic fixes
-- Protected files list to prevent corruption
-- Project directory argument for running against any repo
+Refactored Architecture:
+- NightShiftAgent (Main Controller)
+- LLMClient (Provider Abstraction with Failover)
+- Toolbox (File & Shell Operations)
+- BuildState (Context & Verification)
 """
 
 import os
@@ -18,79 +17,78 @@ import time
 import json
 import logging
 import argparse
+import difflib
 from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
 
-# Parse arguments first to get project directory
-parser = argparse.ArgumentParser(description='🌙 Night Shift Agent - Autonomous Coding Assistant')
-parser.add_argument('--project-dir', '-p', type=str, default='.', 
-                    help='Path to the project directory (default: current directory)')
-parser.add_argument('--continue-on-branch', '-c', action='store_true',
-                    help='Continue using the current git branch instead of creating a new one')
-args = parser.parse_args()
-
-# Change to project directory
-PROJECT_DIR = Path(args.project_dir).resolve()
-if not PROJECT_DIR.exists():
-    print(f"❌ Project directory not found: {PROJECT_DIR}")
-    sys.exit(1)
-os.chdir(PROJECT_DIR)
-
-# Load .env from project directory if it exists, then from agent directory
-load_dotenv(PROJECT_DIR / '.env')
-load_dotenv()  # Also load from agent's directory as fallback
-
 # =============================================================================
-# CONFIGURATION
+# CONFIGURATION & CONSTANTS
 # =============================================================================
 
-AGENT_PROVIDER = os.getenv("PREFERRED_AGENT_PROVIDER", "claude")  # "gemini" or "claude"
-AGENT_MODEL = os.getenv("PREFERRED_AGENT_MODEL", "sonnet")  # gemini model or claude alias (sonnet, opus)
-GH_BOT_TOKEN = os.getenv("GH_BOT_TOKEN")
-BOT_USERNAME = os.getenv("BOT_USERNAME", "agentnightshift")
+load_dotenv()
+
+# Defaults
+DEFAULT_PROVIDER = "gemini"
+DEFAULT_MODEL_GEMINI = "gemini-2.5-flash"
+DEFAULT_MODEL_CLAUDE = "claude-3-5-sonnet-20241022" 
 
 MAX_ITERATIONS = 50
 MAX_RETRIES = 5
 MAX_CI_FIX_ATTEMPTS = 5
 RETRY_BASE_DELAY = 5
-CI_POLL_INTERVAL = 60
 MAX_FILES_IN_CONTEXT = 50
+MAX_CONTEXT_CHARS = 30000
 REQUIRE_BUILD_VERIFICATION = True
-MAX_CONTEXT_CHARS = 30000  # Conservative limit for CLI/shell reliability
-
 BRANCH_PREFIX = "nightshift"
 
-PROTECTED_FILES = {"build.gradle.kts", "settings.gradle.kts", "gradle.properties", "libs.versions.toml", "gradle-wrapper.properties"}
+PROTECTED_FILES = {
+    "build.gradle.kts", "settings.gradle.kts", "gradle.properties", 
+    "libs.versions.toml", "gradle-wrapper.properties"
+}
 
-LOG_DIR = Path(".agent_logs")
-LOG_DIR.mkdir(exist_ok=True)
-LOG_FILE = LOG_DIR / f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+# Logger Setup - Console only at module level, file handlers added in NightShiftAgent.__init__
+SESSION_TIMESTAMP = datetime.now().strftime('%Y%m%d_%H%M%S')
 
 logging.basicConfig(
-    level=logging.DEBUG,  # Changed to DEBUG for troubleshooting
+    level=logging.DEBUG,
     format='%(asctime)s %(levelname)s %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S',
-    handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler(sys.stdout)]
+    handlers=[logging.StreamHandler(sys.stdout)]  # Console only at module load
 )
 logger = logging.getLogger("NightShiftAgent")
 
-# Client removed - using CLI
+# Prompt logger - file handler added later in project directory
+prompt_logger = logging.getLogger("PromptLogger")
+prompt_logger.setLevel(logging.DEBUG)
+prompt_logger.propagate = False  # Don't duplicate to main logger
+
+# =============================================================================
+# EXCEPTIONS
+# =============================================================================
+
+class QuotaExceededError(Exception):
+    """Exception raised when an LLM provider hits a rate limit or quota."""
+    pass
+
+# =============================================================================
+# HELPER CLASSES
+# =============================================================================
 
 class BuildState:
+    """Tracks the state of the build and file changes for verification/rolling back."""
     def __init__(self):
         self.build_attempted = False
         self.build_passed = False
         self.last_error = None
-        self.last_successful_files = {}  # path -> content snapshot after last good build
-        self.files_changed_since_success = []  # track what changed since last success
-    def reset(self): 
+        self.last_successful_files = {}  # path -> content snapshot
+        self.files_changed_since_success = [] 
+
+    def reset(self):
         self.build_attempted = False
         self.build_passed = False
         self.last_error = None
-        # Keep snapshots across task boundaries for debugging
-    def is_verified(self) -> bool:
-        return self.build_attempted and self.build_passed if REQUIRE_BUILD_VERIFICATION else True
+
     def checkpoint(self, files_written: list):
         """Snapshot file contents after successful build."""
         for path in files_written:
@@ -99,968 +97,616 @@ class BuildState:
                     self.last_successful_files[path] = f.read()
             except: pass
         self.files_changed_since_success = []
-        logger.info(f"📸 Checkpoint saved: {len(self.last_successful_files)} files in known-good state")
+        logger.info(f"📸 Checkpoint saved: {len(self.last_successful_files)} files known-good")
 
-build_state = BuildState()
+    def is_verified(self):
+        return self.build_passed
 
-# Rate limiting for command spam prevention
-class CommandRateLimiter:
+class RateLimiter:
+    """Prevents command spam loops."""
     def __init__(self, window_seconds=30, max_identical=3):
-        self.recent_commands = []  # (timestamp, command)
+        self.recent_commands = []
         self.window = window_seconds
         self.max_identical = max_identical
     
     def should_allow(self, command: str) -> tuple[bool, str]:
         current_time = time.time()
-        # Clean old entries
         self.recent_commands = [(t, c) for t, c in self.recent_commands if current_time - t < self.window]
-        # Count identical commands in window
         identical_count = sum(1 for _, c in self.recent_commands if c == command)
         if identical_count >= self.max_identical:
             return False, f"Rate limited: same command executed {identical_count} times in {self.window}s"
         self.recent_commands.append((current_time, command))
         return True, ""
 
-rate_limiter = CommandRateLimiter()
-
 # =============================================================================
-# TOOLS
+# LLM CLIENT (FAILOVER LOGIC)
 # =============================================================================
 
-def read_file(path: str = None, file_path: str = None) -> str:
-    target_path = path or file_path
-    if not target_path: return "Error: No path provided"
-    try:
-        with open(target_path, "r") as f: content = f.read()
-        logger.info(f"📖 Read file: {target_path} ({len(content)} bytes)")
-        return content
-    except Exception as e:
-        logger.error(f"❌ Failed to read {target_path}: {e}")
-        return f"Error reading file {target_path}: {e}"
+class LLMClient:
+    """Handles communication with LLM CLIs including failover logic."""
+    def __init__(self):
+        self.provider = os.getenv("PREFERRED_AGENT_PROVIDER", DEFAULT_PROVIDER)
+        self.model = os.getenv("PREFERRED_AGENT_MODEL", DEFAULT_MODEL_GEMINI if self.provider == "gemini" else "")
+    
+    def strip_markdown_code_blocks(self, text: str) -> str:
+        text = text.strip()
+        if text.startswith("```"):
+            lines = text.split('\n')
+            if lines[0].startswith("```"): lines = lines[1:]
+            if lines and lines[-1].strip() == "```": lines = lines[:-1]
+            return '\n'.join(lines).strip()
+        return text
 
-def write_file(path: str = None, content: str = None, file_path: str = None, code: str = None, file_content: str = None) -> str:
-    target_path = path or file_path
-    target_content = content or code or file_content or ""
-    
-    if not target_path: return "Error: No path provided"
-    
-    filename = os.path.basename(target_path)
-    if filename in PROTECTED_FILES:
-        logger.warning(f"🛡️ BLOCKED: {target_path}")
-        return f"ERROR: {filename} is protected. Fix source code instead."
-    try:
-        # Read existing content for diff logging
-        old_content = ""
-        if os.path.exists(target_path):
+    def call_gemini(self, prompt: str):
+        logger.info(f"🤖 Calling Gemini CLI... (Model: {self.model})")
+        
+        # Log the outgoing prompt
+        prompt_logger.debug(
+            f"{'='*80}\n"
+            f">>> PROMPT TO GEMINI (Model: {self.model})\n"
+            f"{'='*80}\n"
+            f"{prompt}\n"
+            f"{'='*80}\n"
+        )
+        
+        for attempt in range(MAX_RETRIES):
             try:
-                with open(target_path, "r") as f:
-                    old_content = f.read()
-            except: pass
-        
-        os.makedirs(os.path.dirname(target_path) if os.path.dirname(target_path) else ".", exist_ok=True)
-        with open(target_path, "w") as f: f.write(target_content)
-        logger.info(f"✍️ Wrote file: {target_path} ({len(target_content)} bytes)")
-        
-        # Log what changed (compact diff summary)
-        if old_content:
-            old_lines = old_content.splitlines()
-            new_lines = target_content.splitlines()
-            added = len(new_lines) - len(old_lines)
-            change_desc = f"+{added} lines" if added > 0 else f"{added} lines" if added < 0 else "same line count"
-            logger.info(f"   📝 Change: {change_desc}, was {len(old_content)}B -> now {len(target_content)}B")
-            # Log first few changed lines for debugging
-            import difflib
-            diff = list(difflib.unified_diff(old_lines[:50], new_lines[:50], lineterm='', n=0))
-            if diff:
-                # Only log first 5 diff lines to keep logs manageable
-                for line in diff[2:7]:  # Skip the --- +++ headers
-                    logger.info(f"   {line[:100]}{'...' if len(line) > 100 else ''}")
-                if len(diff) > 7:
-                    logger.info(f"   ... and {len(diff) - 7} more diff lines")
-        else:
-            logger.info(f"   📝 New file created")
-        
-        # Track what we've changed since last successful build
-        build_state.files_changed_since_success.append(target_path)
-        build_state.build_passed = False
-        build_state.build_attempted = False
-        return f"Successfully wrote to {target_path}"
-    except Exception as e:
-        logger.error(f"❌ Failed to write {target_path}: {e}")
-        return f"Error writing to file {target_path}: {e}"
-
-def list_files(path: str = ".") -> str:
-    files = []
-    ignore = {".git", ".gradle", ".idea", ".venv", "__pycache__", "build", ".kotlin", "node_modules"}
-    logger.info(f"📂 Listing files in: {path}")
-    for root, dirs, filenames in os.walk(path):
-        dirs[:] = [d for d in dirs if d not in ignore and not d.startswith(".")]
-        for f in filenames:
-            if not f.startswith(".") and not any(f.endswith(e) for e in [".jar", ".class", ".pyc"]):
-                files.append(os.path.join(root, f))
-                if len(files) >= MAX_FILES_IN_CONTEXT: return "\n".join(files + ["...(truncated)"])
-    return "\n".join(files)
-
-def run_shell(command: str) -> str:
-    global build_state
-    
-    # Rate limiting check
-    allowed, reason = rate_limiter.should_allow(command)
-    if not allowed:
-        logger.warning(f"🚫 {reason}")
-        return f"Error: {reason}. Try a different approach or read error logs first."
-    
-    logger.info(f"🤖 Executing: {command}")
-    try:
-        env = os.environ.copy()
-        if GH_BOT_TOKEN and command.strip().startswith("gh "):
-            env["GITHUB_TOKEN"] = GH_BOT_TOKEN
-            env["GH_TOKEN"] = GH_BOT_TOKEN
-        result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=600, env=env)
-        output = result.stdout + result.stderr
-        # Only treat as build command if it's actually running gradlew/gradle
-        is_build_command = command.strip().startswith("./gradlew") or command.strip().startswith("gradlew") or command.strip().startswith("gradle ")
-        
-        if is_build_command:
-            build_state.build_attempted = True
-            build_state.build_passed = result.returncode == 0
-            if result.returncode == 0:
-                logger.info("✅ Command succeeded")
-                # Checkpoint: save state of files changed since last success
-                if build_state.files_changed_since_success:
-                    logger.info(f"📸 Build passed after changing: {build_state.files_changed_since_success}")
-                    build_state.checkpoint(build_state.files_changed_since_success)
-            else:
-                logger.warning(f"⚠️ Command failed (exit {result.returncode})")
-                # Log what we changed that might have broken it
-                if build_state.files_changed_since_success:
-                    logger.warning(f"   ⚠️ Files changed since last success: {build_state.files_changed_since_success}")
-                    # Log what we could revert to
-                    revertable = [p for p in build_state.files_changed_since_success if p in build_state.last_successful_files]
-                    if revertable:
-                        logger.info(f"   💡 Could revert to checkpoint: {revertable}")
-        
-        if result.returncode != 0:
-            return f"Command failed (exit {result.returncode}):\n{output}"
-        return output
-    except subprocess.TimeoutExpired: return "Error: Command timed out"
-    except Exception as e: return f"Error: {e}"
-
-# Tools list removed - handled by system prompt
-
-def extract_json_objects(text: str) -> list:
-    """Extract JSON objects, prioritizing <agent_action> tags."""
-    objects = []
-    
-    # Strategy 1: Look for <agent_action> tags (Best for Gemini CLI)
-    matches = re.findall(r'<agent_action>(.*?)</agent_action>', text, re.DOTALL)
-    for match in matches:
-        try:
-            # Clean up potential markdown code blocks inside tags
-            clean_json = strip_markdown_code_blocks(match.strip())
-            return [clean_json] # Return immediately if found
-        except:
-            pass
-            
-    # Strategy 2: Fallback to finding raw JSON objects (Legacy/Claude)
-    i = 0
-    while i < len(text):
-        if text[i] == '{':
-            depth = 0
-            start = i
-            in_string = False
-            escape_next = False
-            while i < len(text):
-                char = text[i]
-                if escape_next:
-                    escape_next = False
-                elif char == '\\' and in_string:
-                    escape_next = True
-                elif char == '"' and not escape_next:
-                    in_string = not in_string
-                elif not in_string:
-                    if char == '{':
-                        depth += 1
-                    elif char == '}':
-                        depth -= 1
-                        if depth == 0:
-                            json_candidate = text[start:i+1]
-                            # Validate it's actually valid JSON
-                            try:
-                                json.loads(json_candidate)
-                                objects.append(json_candidate)
-                            except json.JSONDecodeError:
-                                logger.debug(f"   🔍 Invalid JSON candidate (len={len(json_candidate)}): {json_candidate[:100]}...")
-                            break
-                i += 1
-        i += 1
-    if objects:
-        logger.debug(f"   🔍 Extracted {len(objects)} JSON object(s) from response")
-    return objects
-
-def search_file_content(pattern, dir_path=".", include=None):
-    cmd = f"grep -r '{pattern}' {dir_path}"
-    if include:
-        cmd += f" --include='{include}'"
-    return run_shell(cmd)
-
-def replace_in_file(path: str = None, file_path: str = None, old_string: str = None, new_string: str = None, instruction: str = None, **kwargs) -> str:
-    """Replace text in a file (Gemini CLI's 'replace' tool)."""
-    target_path = path or file_path
-    if not target_path:
-        return "Error: No file_path (or path) provided"
-    if not old_string or new_string is None:
-        return "Error: old_string and new_string are required"
-    
-    try:
-        with open(target_path, "r") as f:
-            content = f.read()
-            
-        if new_string in content:
-            return f"Success: Text already present in {target_path}"
-        
-        if old_string not in content:
-            return f"Error: Could not find the specified text in {target_path}"
-        
-        new_content = content.replace(old_string, new_string, 1)
-        with open(target_path, "w") as f:
-            f.write(new_content)
-        
-        logger.info(f"✏️ Replaced text in: {target_path}")
-        build_state.files_changed_since_success.append(target_path)
-        build_state.build_passed = False
-        build_state.build_attempted = False
-        return f"Successfully replaced text in {target_path}"
-    except Exception as e:
-        return f"Error replacing in {target_path}: {e}"
-
-available_functions = {
-    "read_file": read_file, 
-    "write_file": write_file, 
-    "list_files": list_files, 
-    "run_shell": run_shell,
-    "run_shell_command": run_shell,
-    "search_file_content": search_file_content,
-    "replace": replace_in_file
-}
-
-class QuotaExceededError(Exception):
-    """Exception raised when an LLM provider hits a rate limit or quota."""
-    pass
-
-def strip_markdown_code_blocks(text: str) -> str:
-    """Strip markdown code block wrappers from text."""
-    text = text.strip()
-    if text.startswith("```"):
-        lines = text.split('\n')
-        # Remove opening ``` or ```json
-        if lines[0].startswith("```"):
-            lines = lines[1:]
-        # Remove closing ```
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-        return '\n'.join(lines).strip()
-    return text
-
-def call_gemini_cli(prompt: str):
-    """Call Gemini CLI"""
-    logger.info("🤖 Calling Gemini CLI...")
-    for attempt in range(MAX_RETRIES):
-        try:
-            # Let Gemini CLI execute in text mode (no --output-format json)
-            # This prevents it from intercepting tool calls
-            result = subprocess.run(
-                ["gemini", "--model", AGENT_MODEL],
-                input=prompt,
-                capture_output=True,
-                text=True,
-                timeout=300
-            )
-            
-            # Debug: log raw output
-            logger.debug(f"   📤 Gemini stdout length: {len(result.stdout)}")
-            logger.debug(f"   📤 Gemini stderr: {result.stderr[:200] if result.stderr else 'none'}")
-
-            # Check for Quota/Rate Limit Errors in stdout/stderr
-            combined_output = (result.stdout + result.stderr).lower()
-            if "quota exceeded" in combined_output or "resource exhausted" in combined_output or "429" in combined_output:
-                logger.error("🚨 Gemini Quota Exceeded!")
-                raise QuotaExceededError("Gemini Quota Exceeded")
-            
-            if result.returncode != 0:
-                logger.warning(f"⚠️ CLI Error (Attempt {attempt+1}/{MAX_RETRIES}): {result.stderr}")
-                if attempt < MAX_RETRIES - 1:
-                    time.sleep(RETRY_BASE_DELAY * (2 ** attempt))
-                    continue
-                return None
-
-            # Raw text output logic (no JSON wrapper)
-            response_text = result.stdout.strip()
-            # Strip markdown code blocks if present
-            response_text = strip_markdown_code_blocks(response_text)
-            logger.debug(f"   📥 Gemini response length: {len(response_text)}, starts with: {response_text[:100]}...")
-            return response_text
-
-
-        except QuotaExceededError:
-            raise
-        except Exception as e:
-            logger.warning(f"⚠️ CLI Exception (Attempt {attempt+1}/{MAX_RETRIES}): {e}")
-            if attempt < MAX_RETRIES - 1:
-                time.sleep(RETRY_BASE_DELAY * (2 ** attempt))
-            else:
-                return None
-    return None
-
-def call_claude_cli(prompt: str):
-    """Call Claude Code CLI in print mode (text only), relying on prompt for structure."""
-    logger.info(f"🤖 Calling Claude CLI... (Prompt length: {len(prompt)} chars)")
-    for attempt in range(MAX_RETRIES):
-        try:
-            # Write prompt to temp file
-            import tempfile
-            with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt') as f:
-                f.write(prompt)
-                temp_prompt_path = f.name
-            
-            try:
-                # No --json-schema or --output-format json -> Raw text output
-                model_arg = f"--model {AGENT_MODEL}" if AGENT_MODEL else ""
-                cmd = f"cat {temp_prompt_path} | claude -p {model_arg} --dangerously-skip-permissions"
-                logger.debug(f"   📤 Claude command: {cmd}")
-                
+                # Use JSON output for structure reliability
+                # --sandbox false disables CLI's internal tools so it acts as pure text generator
                 result = subprocess.run(
-                    cmd,
-                    shell=True,
-                    capture_output=True,
-                    text=True,
-                    timeout=300
+                    ["gemini", "--model", self.model, "--sandbox", "false", "--output-format", "json"],
+                    input=prompt, capture_output=True, text=True, timeout=300
                 )
                 
-                if result.returncode != 0:
-                    # Check for Quota/Rate Limit in stdout/stderr (Claude prints to stdout usually)
-                    combined_output = (result.stdout + result.stderr).lower()
-                    if "hit your limit" in combined_output or "rate limit" in combined_output:
-                         logger.error("🚨 Claude Quota Exceeded!")
-                         raise QuotaExceededError("Claude Quota Exceeded")
+                # Log the raw CLI response
+                prompt_logger.debug(
+                    f"{'='*80}\n"
+                    f"<<< RAW RESPONSE FROM GEMINI (Attempt {attempt+1}, Return Code: {result.returncode})\n"
+                    f"{'='*80}\n"
+                    f"STDOUT:\n{result.stdout}\n"
+                    f"{'~'*40}\n"
+                    f"STDERR:\n{result.stderr}\n"
+                    f"{'='*80}\n"
+                )
+                
+                # Check Quota - only check stderr for errors, not stdout which may contain session IDs with 429 substring
+                stderr_lower = result.stderr.lower()
+                if any(x in stderr_lower for x in ["quota exceeded", "resource exhausted", "rate limit"]):
+                    logger.error("🚨 Gemini Quota Exceeded!")
+                    raise QuotaExceededError("Gemini Quota Exceeded")
+                # Also check for explicit HTTP 429 status code pattern in stderr
+                if "429" in stderr_lower and ("error" in stderr_lower or "too many" in stderr_lower):
+                    logger.error("🚨 Gemini Rate Limited (429)!")
+                    raise QuotaExceededError("Gemini Rate Limited")
 
-                    logger.warning(f"⚠️ CLI Error (Attempt {attempt+1}/{MAX_RETRIES}): {result.stderr}")
+                # Parse JSON Output
+                if result.returncode == 0 and result.stdout.strip():
+                    try:
+                        data = json.loads(result.stdout.strip())
+                        # Handle potential list or single object
+                        if isinstance(data, list): data = data[0]
+                        
+                        # Extract content based on CLI schema (usually "response" or "content")
+                        # Adjust structure based on actual CLI output verification
+                        response_text = data.get("response") or data.get("content") or json.dumps(data)
+                        parsed_response = self.strip_markdown_code_blocks(response_text)
+                        
+                        # Log the parsed response
+                        prompt_logger.debug(
+                            f"{'='*80}\n"
+                            f"<<< PARSED RESPONSE FROM GEMINI\n"
+                            f"{'='*80}\n"
+                            f"{parsed_response}\n"
+                            f"{'='*80}\n"
+                        )
+                        return parsed_response
+                    except json.JSONDecodeError:
+                         logger.warning(f"⚠️ Failed to parse CLI JSON: {result.stdout[:200]}")
+                
+                if result.returncode != 0:
+                    logger.warning(f"⚠️ CLI Error ({attempt+1}/{MAX_RETRIES}): {result.stderr}")
                     if attempt < MAX_RETRIES - 1:
                         time.sleep(RETRY_BASE_DELAY * (2 ** attempt))
                         continue
                     return None
-
-                response_text = result.stdout.strip()
-                # Strip markdown code blocks if present (helper handles it)
-                response_text = strip_markdown_code_blocks(response_text)
                 
-                logger.debug(f"   📥 Claude response length: {len(response_text)}, starts with: {response_text[:100]}...")
-                return response_text
+                # Fallback if no JSON but success (shouldn't happen with -o json)
+                return self.strip_markdown_code_blocks(result.stdout.strip())
+
+            except QuotaExceededError:
+                raise
+            except Exception as e:
+                logger.warning(f"⚠️ CLI Exception ({attempt+1}/{MAX_RETRIES}): {e}")
+                if attempt < MAX_RETRIES - 1: time.sleep(RETRY_BASE_DELAY * (2 ** attempt))
+                else: return None
+        return None
+
+    def call_claude(self, prompt: str):
+        logger.info(f"🤖 Calling Claude CLI... (Model: {self.model})")
+        
+        # Log the outgoing prompt
+        prompt_logger.debug(
+            f"{'='*80}\n"
+            f">>> PROMPT TO CLAUDE (Model: {self.model or 'default'})\n"
+            f"{'='*80}\n"
+            f"{prompt}\n"
+            f"{'='*80}\n"
+        )
+        
+        for attempt in range(MAX_RETRIES):
+            try:
+                import tempfile
+                with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt') as f:
+                    f.write(prompt)
+                    temp_path = f.name
                 
-            finally:
-                if os.path.exists(temp_prompt_path):
-                    os.unlink(temp_prompt_path)
+                try:
+                    model_arg = f"--model {self.model}" if self.model else ""
+                    cmd = f"cat {temp_path} | claude -p {model_arg} --dangerously-skip-permissions"
+                    result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=300)
+                    
+                    # Log the raw CLI response
+                    prompt_logger.debug(
+                        f"{'='*80}\n"
+                        f"<<< RAW RESPONSE FROM CLAUDE (Attempt {attempt+1}, Return Code: {result.returncode})\n"
+                        f"{'='*80}\n"
+                        f"STDOUT:\n{result.stdout}\n"
+                        f"{'~'*40}\n"
+                        f"STDERR:\n{result.stderr}\n"
+                        f"{'='*80}\n"
+                    )
 
-        except QuotaExceededError:
-            raise
-        except Exception as e:
-            logger.warning(f"⚠️ CLI Exception (Attempt {attempt+1}/{MAX_RETRIES}): {e}")
-            if attempt < MAX_RETRIES - 1:
-                time.sleep(RETRY_BASE_DELAY * (2 ** attempt))
-            else:
-                return None
-    return None
+                    # Check Quota
+                    combined = (result.stdout + result.stderr).lower()
+                    if any(x in combined for x in ["hit your limit", "rate limit"]):
+                        logger.error("🚨 Claude Quota Exceeded!")
+                        raise QuotaExceededError("Claude Quota Exceeded")
 
-def call_llm_cli(prompt: str):
-    """Route to the appropriate CLI based on AGENT_PROVIDER, with auto-failover on quota limits."""
-    global AGENT_PROVIDER, AGENT_MODEL
+                    if result.returncode != 0:
+                        logger.warning(f"⚠️ CLI Error ({attempt+1}/{MAX_RETRIES}): {result.stderr}")
+                        if attempt < MAX_RETRIES - 1:
+                            time.sleep(RETRY_BASE_DELAY * (2 ** attempt))
+                            continue
+                        return None
+                    
+                    parsed_response = self.strip_markdown_code_blocks(result.stdout.strip())
+                    
+                    # Log the parsed response
+                    prompt_logger.debug(
+                        f"{'='*80}\n"
+                        f"<<< PARSED RESPONSE FROM CLAUDE\n"
+                        f"{'='*80}\n"
+                        f"{parsed_response}\n"
+                        f"{'='*80}\n"
+                    )
+                    return parsed_response
+                finally:
+                    if os.path.exists(temp_path): os.unlink(temp_path)
 
-    # Store original provider to prevent infinite failover loops in one call if both fail
-    original_provider = AGENT_PROVIDER
+            except QuotaExceededError:
+                raise
+            except Exception as e:
+                logger.warning(f"⚠️ CLI Exception ({attempt+1}/{MAX_RETRIES}): {e}")
+                if attempt < MAX_RETRIES - 1: time.sleep(RETRY_BASE_DELAY * (2 ** attempt))
+                else: return None
+        return None
 
-    while True:
+    def ask(self, prompt: str):
+        """Main entry point with failover."""
+        original_provider = self.provider
+        while True:
+            try:
+                if self.provider == "claude":
+                    return self.call_claude(prompt)
+                else:
+                    return self.call_gemini(prompt)
+            except QuotaExceededError:
+                logger.warning(f"🛑 {self.provider.title()} Quota Exceeded. Switching...")
+                
+                # Switch
+                if self.provider == "claude":
+                    self.provider = "gemini"
+                    self.model = DEFAULT_MODEL_GEMINI
+                else:
+                    self.provider = "claude"
+                    self.model = "" # Default
+
+                if self.provider == original_provider:
+                    logger.error("❌ Both providers exhausted! Stopping.")
+                    return None
+                
+                logger.info(f"🔄 Switched to {self.provider.title()}. Retrying...")
+
+# =============================================================================
+# TOOLBOX
+# =============================================================================
+
+class Toolbox:
+    def __init__(self, build_state: BuildState):
+        self.build_state = build_state
+        self.rate_limiter = RateLimiter()
+
+    def read_file(self, path: str = None, file_path: str = None) -> str:
+        target = path or file_path
+        if not target: return "Error: No path"
         try:
-            if AGENT_PROVIDER == "claude":
-                return call_claude_cli(prompt)
-            else:
-                return call_gemini_cli(prompt)
-        except QuotaExceededError:
-            logger.warning(f"🛑 {AGENT_PROVIDER.title()} Quota Exceeded. Attempting to switch providers...")
+            with open(target, "r") as f: content = f.read()
+            logger.info(f"📖 Read file: {target}")
+            return content
+        except Exception as e: return f"Error reading {target}: {e}"
+
+    def write_file(self, path: str = None, content: str = None, **kwargs) -> str:
+        target = path or kwargs.get('file_path')
+        content = content or kwargs.get('code') or kwargs.get('file_content') or ""
+        if not target: return "Error: No path"
+        
+        if os.path.basename(target) in PROTECTED_FILES:
+            return f"ERROR: {target} is protected."
+
+        try:
+            os.makedirs(os.path.dirname(target) if os.path.dirname(target) else ".", exist_ok=True)
+            with open(target, "w") as f: f.write(content)
+            logger.info(f"✍️ Wrote file: {target}")
             
-            # Switch Provider
-            if AGENT_PROVIDER == "claude":
-                AGENT_PROVIDER = "gemini"
-                AGENT_MODEL = "gemini-2.5-flash"
-            else:
-                AGENT_PROVIDER = "claude"
-                AGENT_MODEL = "" # Default for Claude CLI
+            self.build_state.files_changed_since_success.append(target)
+            self.build_state.build_passed = False
+            self.build_state.build_attempted = False
+            return f"Successfully wrote to {target}"
+        except Exception as e: return f"Error writing {target}: {e}"
 
-            # Detect if we cycled back to original provider (both failed)
-            if AGENT_PROVIDER == original_provider:
-                 logger.error("❌ Both providers have exceeded their quotas! Stopping.")
-                 return None
-            
-            logger.info(f"🔄 Switched to {AGENT_PROVIDER.title()} (Model: {AGENT_MODEL or 'Default'}). Retrying...")
-            # Loop continues and tries new provider
+    def run_shell(self, command: str) -> str:
+        allowed, reason = self.rate_limiter.should_allow(command)
+        if not allowed: return f"Error: {reason}"
 
-
-
-# =============================================================================
-# GIT HELPERS
-# =============================================================================
-
-def run_cmd(command: str, timeout: int = 120) -> tuple[bool, str]:
-    try:
+        logger.info(f"🤖 Executing: {command}")
+        
         env = os.environ.copy()
-        if GH_BOT_TOKEN and command.strip().startswith("gh "):
-            env["GITHUB_TOKEN"] = GH_BOT_TOKEN
-            env["GH_TOKEN"] = GH_BOT_TOKEN
-        result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=timeout, env=env)
-        return result.returncode == 0, (result.stdout + result.stderr).strip()
-    except Exception as e: return False, str(e)
+        if os.getenv("GH_BOT_TOKEN") and command.strip().startswith("gh "):
+            env["GITHUB_TOKEN"] = os.getenv("GH_BOT_TOKEN")
 
-def get_repo_info() -> dict:
-    success, output = run_cmd("gh repo view --json nameWithOwner,url")
-    try: return json.loads(output) if success else {}
-    except: return {}
-
-def setup_origin_with_bot_token() -> bool:
-    logger.info("🔧 Configuring git authentication...")
-    repo_info = get_repo_info()
-    repo_name = repo_info.get("nameWithOwner", "")
-    if not repo_name:
-        logger.error("❌ Could not determine repository")
-        return False
-    logger.info(f"📦 Repository: {repo_name}")
-    if GH_BOT_TOKEN:
-        run_cmd(f'git config user.name "{BOT_USERNAME}"')
-        run_cmd(f'git config user.email "{BOT_USERNAME}@users.noreply.github.com"')
-        origin_url = f"https://{BOT_USERNAME}:{GH_BOT_TOKEN}@github.com/{repo_name}.git"
-        run_cmd(f'git remote set-url origin "{origin_url}"')
-        logger.info("✅ Git configured with bot credentials")
-    return True
-
-def find_existing_open_pr() -> tuple[str, str]:
-    """Check if there's an existing open PR from a nightshift branch. Returns (branch_name, pr_url) or empty strings."""
-    repo_info = get_repo_info()
-    repo_name = repo_info.get("nameWithOwner", "")
-    success, output = run_cmd(f'gh pr list --state open --repo {repo_name} --author {BOT_USERNAME} --json headRefName,url --jq ".[] | select(.headRefName | startswith(\\"{BRANCH_PREFIX}/\\"))"')
-    if success and output.strip():
         try:
-            # Parse the first matching PR
-            lines = output.strip().split('\n')
-            if lines:
-                pr_data = json.loads(lines[0])
-                return pr_data.get("headRefName", ""), pr_data.get("url", "")
-        except: pass
-    return "", ""
+            result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=600, env=env)
+            
+            # Simple build detection
+            if any(x in command for x in ["./gradlew", "gradlew", "gradle "]):
+                self.build_state.build_attempted = True
+                self.build_state.build_passed = (result.returncode == 0)
+                if result.returncode == 0:
+                    logger.info("✅ Build Succeeded")
+                    if self.build_state.files_changed_since_success:
+                        self.build_state.checkpoint(self.build_state.files_changed_since_success)
+                else:
+                    logger.warning(f"⚠️ Build Failed (Exit {result.returncode})")
 
-def create_feature_branch() -> str:
-    # Check if we should continue on current branch
-    if args.continue_on_branch:
-        success, output = run_cmd("git rev-parse --abbrev-ref HEAD")
-        if success:
-            branch_name = output.strip()
-            logger.info(f"🌿 Continuing on current branch: {branch_name}")
-            return branch_name
-        else:
-            logger.error("❌ Failed to get current branch name")
-            sys.exit(1)
+            if result.returncode != 0:
+                return f"Command failed (exit {result.returncode}):\n{result.stdout + result.stderr}"
+            return result.stdout + result.stderr
+        except Exception as e: return f"Error: {e}"
 
-    # Check for existing open PR first
-    existing_branch, existing_pr = find_existing_open_pr()
-    if existing_branch:
-        logger.info(f"🔄 Found existing open PR: {existing_pr}")
-        logger.info(f"🌿 Reusing branch: {existing_branch}")
-        run_cmd(f"git fetch origin {existing_branch}")
-        run_cmd(f"git checkout {existing_branch}")
-        run_cmd(f"git pull origin {existing_branch}")
-        return existing_branch
-    
-    # No existing PR, create new branch
-    branch_name = f"{BRANCH_PREFIX}/{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-    logger.info(f"🌿 Creating feature branch: {branch_name}")
-    
-    # Safe checkout workflow
-    success, output = run_cmd("git checkout main")
-    if not success:
-        logger.error(f"❌ Failed to checkout main: {output}")
-        # Try to stash changes if checkout fails due to dirty state
-        logger.warning("⚠️ Stashing local changes to proceed...")
-        run_cmd("git stash push -m 'Night Shift Agent Stash'")
-        success, output = run_cmd("git checkout main")
-        if not success:
-             logger.error("❌ Still failed to checkout main. Aborting.")
-             sys.exit(1)
-
-    run_cmd("git pull origin main")
-    
-    run_cmd(f"git checkout -b {branch_name}")
-    logger.info(f"✅ Created branch: {branch_name}")
-    return branch_name
-
-def push_branch(branch_name: str) -> bool:
-    logger.info(f"📤 Pushing branch to origin: {branch_name}")
-    success, output = run_cmd(f"git push -u origin {branch_name} --force")
-    if success: logger.info("✅ Pushed successfully")
-    else: logger.error(f"❌ Push failed: {output}")
-    return success
-
-def create_pull_request(branch_name: str, title: str, body: str) -> tuple[bool, str]:
-    logger.info("📝 Creating Pull Request...")
-    repo_info = get_repo_info()
-    repo_name = repo_info.get("nameWithOwner", "")
-    if not repo_name: return False, "No repo"
-    
-    # Check if PR already exists for this branch
-    success, existing_pr = run_cmd(f'gh pr view {branch_name} --repo {repo_name} --json url --jq .url')
-    if success and existing_pr.strip():
-        pr_url = existing_pr.strip()
-        logger.info(f"✅ PR already exists: {pr_url}")
-        return True, pr_url
-    
-    safe_title = title.replace('"', '\\"')
-    safe_body = body.replace('"', '\\"')
-    cmd = f'gh pr create --repo {repo_name} --head "{branch_name}" --title "{safe_title}" --body "{safe_body}"'
-    success, output = run_cmd(cmd, timeout=60)
-    if success:
-        pr_url = output.strip().split('\n')[-1]
-        logger.info(f"✅ Created PR: {pr_url}")
-        return True, pr_url
-    logger.error(f"❌ Failed: {output}")
-    return False, output
-
-def get_pr_number_from_branch(branch_name: str) -> str:
-    repo_info = get_repo_info()
-    repo_name = repo_info.get("nameWithOwner", "")
-    success, output = run_cmd(f'gh pr list --state all --repo {repo_name} --head "{branch_name}" --json number --jq ".[0].number"')
-    return output.strip() if success else ""
-
-def is_pr_merged(branch_name: str) -> bool:
-    pr_number = get_pr_number_from_branch(branch_name)
-    if not pr_number: return False
-    repo_info = get_repo_info()
-    repo_name = repo_info.get("nameWithOwner", "")
-    success, output = run_cmd(f'gh pr view {pr_number} --repo {repo_name} --json state --jq .state')
-    return output.strip() == "MERGED" if success else False
-
-def get_pr_status(branch_name: str) -> dict:
-    pr_number = get_pr_number_from_branch(branch_name)
-    if not pr_number: return {"success": False}
-    repo_info = get_repo_info()
-    success, output = run_cmd(f'gh pr checks {pr_number} --repo {repo_info.get("nameWithOwner", "")} --json name,state,conclusion')
-    if success:
+    def replace(self, path: str = None, old_string: str = None, new_string: str = None, **kwargs) -> str:
+        target = path or kwargs.get('file_path')
+        if not target or not old_string or new_string is None: return "Error: Missing args"
+        
         try:
-            checks = json.loads(output)
-            return {"success": True, "all_passed": all(c.get("conclusion") == "success" for c in checks if c.get("state") == "completed"),
-                    "any_failed": any(c.get("conclusion") == "failure" for c in checks),
-                    "pending": any(c.get("state") in ["pending", "queued", "in_progress"] for c in checks)}
-        except: pass
-    return {"success": False}
+            with open(target, "r") as f: content = f.read()
+            if new_string in content: return f"Success: Text already present in {target}"
+            if old_string not in content: return f"Error: Text not found in {target}"
+            
+            with open(target, "w") as f: f.write(content.replace(old_string, new_string, 1))
+            
+            logger.info(f"✏️ Replaced text in: {target}")
+            self.build_state.files_changed_since_success.append(target)
+            self.build_state.build_passed = False
+            self.build_state.build_attempted = False
+            return f"Successfully replaced text in {target}"
+        except Exception as e: return f"Error: {e}"
+    
+    def list_files(self, path="."):
+        files = []
+        ignore = {".git", ".gradle", ".idea", "build", ".kotlin", "node_modules", ".agent_logs"}
+        for root, dirs, filenames in os.walk(path):
+            dirs[:] = [d for d in dirs if d not in ignore and not d.startswith(".")]
+            for f in filenames:
+                if not f.startswith(".") and not f.endswith(('.jar','.class','.pyc')):
+                    files.append(os.path.join(root, f))
+        return "\n".join(files[:MAX_FILES_IN_CONTEXT])
 
-def get_pr_check_logs(branch_name: str) -> str:
-    pr_number = get_pr_number_from_branch(branch_name)
-    if not pr_number: return "No PR"
-    repo_info = get_repo_info()
-    success, output = run_cmd(f'gh pr checks {pr_number} --repo {repo_info.get("nameWithOwner", "")} --json name,conclusion,detailsUrl')
-    if not success: return output
-    try:
-        checks = json.loads(output)
-        failed = [c for c in checks if c.get("conclusion") == "failure"]
-        return "\n".join([f"- {c.get('name')}: {c.get('detailsUrl')}" for c in failed]) if failed else "No failures"
-    except: return output
+    def dispatch(self, tool_name, args):
+        mapping = {
+            "read_file": self.read_file, "write_file": self.write_file,
+            "run_shell": self.run_shell, "run_shell_command": self.run_shell, # Alias
+            "replace": self.replace, "list_files": self.list_files
+        }
+        
+        # Arg Normalization
+        if tool_name in ["run_shell", "run_shell_command"]:
+            # Extensive alias mapping for creative models
+            cmd = (args.get("command") or args.get("cmd") or args.get("code") or 
+                   args.get("script") or args.get("command_line") or 
+                   args.get("cli") or args.get("exec") or args.get("input") or args.get("bash"))
+            if cmd: args["command"] = cmd
+        
+        if tool_name == "replace":
+            old = args.get("search") or args.get("old") or args.get("original") or args.get("pattern")
+            new = args.get("replace") or args.get("new") or args.get("content") or args.get("replacement")
+            if old: args["old_string"] = old
+            if new: args["new_string"] = new
+        
+        # Normalize path arguments across all file-related tools
+        if "dir_path" in args: args["path"] = args.pop("dir_path")
+        if "directory" in args: args["path"] = args.pop("directory")
+        if "file_path" in args: args["path"] = args.pop("file_path")
+        
+        # Handle search_file_content by mapping to grep
+        if tool_name == "search_file_content":
+            pattern = args.get("pattern", "")
+            include = args.get("include", "*.kt")
+            # Convert to grep command and clear other args
+            command = f"grep -rn '{pattern}' --include='{include}' ."
+            args = {"command": command}  # Clear all other args, only keep command
+            tool_name = "run_shell"
+        
+        logger.info(f"Arguments for {tool_name}: {args}")
+
+        func = mapping.get(tool_name)
+        if func: return func(**args)
+        return f"Unknown tool: {tool_name}. Available tools: {', '.join(mapping.keys())}"
 
 # =============================================================================
-# TASK PROCESSING
+# MAIN AGENT CONTROLLER
 # =============================================================================
 
-def process_task(task: str, arch: str, files: str) -> bool:
-    global build_state
-    build_state.reset()
-    system_prompt = f"""You are Night Shift Agent for a Kotlin Multiplatform project.
+class NightShiftAgent:
+    def __init__(self, project_dir):
+        self.project_dir = Path(project_dir).resolve()
+        if not self.project_dir.exists():
+            raise ValueError(f"Project dir not found: {project_dir}")
+        os.chdir(self.project_dir)
+        load_dotenv(self.project_dir / '.env')
+        
+        # Set up file logging in the project directory
+        self._setup_logging()
+        
+        self.build_state = BuildState()
+        self.toolbox = Toolbox(self.build_state)
+        self.llm = LLMClient()
+        self.bot_username = os.getenv("BOT_USERNAME", "agentnightshift")
+        self.gh_token = os.getenv("GH_BOT_TOKEN")
+    
+    def _setup_logging(self):
+        """Set up file handlers in the project directory."""
+        log_dir = self.project_dir / ".agent_logs"
+        log_dir.mkdir(exist_ok=True)
+        
+        log_file = log_dir / f"session_{SESSION_TIMESTAMP}.log"
+        prompt_log_file = log_dir / f"prompts_{SESSION_TIMESTAMP}.log"
+        
+        # Add file handler to main logger
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s', '%Y-%m-%d %H:%M:%S'))
+        logger.addHandler(file_handler)
+        
+        # Add file handler to prompt logger
+        prompt_handler = logging.FileHandler(prompt_log_file)
+        prompt_handler.setFormatter(logging.Formatter('%(asctime)s\n%(message)s\n'))
+        prompt_logger.addHandler(prompt_handler)
+        
+        logger.info(f"📁 Logging to: {log_dir}")
 
-ARCHITECTURE:
+    def run_cmd_quiet(self, cmd):
+        env = os.environ.copy()
+        if self.gh_token: env["GITHUB_TOKEN"] = self.gh_token
+        return subprocess.run(cmd, shell=True, capture_output=True, text=True, env=env)
+
+    def configure_git(self):
+        logger.info("🔧 Configuring git...")
+        repo = self.run_cmd_quiet("gh repo view --json nameWithOwner --jq .nameWithOwner").stdout.strip()
+        if self.gh_token and repo:
+            url = f"https://{self.bot_username}:{self.gh_token}@github.com/{repo}.git"
+            self.run_cmd_quiet(f'git remote set-url origin "{url}"')
+            self.run_cmd_quiet(f'git config user.name "{self.bot_username}"')
+            self.run_cmd_quiet(f'git config user.email "{self.bot_username}@users.noreply.github.com"')
+            logger.info(f"✅ Authenticated for {repo}")
+
+    def create_branch(self):
+        ts = datetime.now().strftime('%Y%m%d-%H%M%S')
+        branch = f"{BRANCH_PREFIX}/{ts}"
+        self.run_cmd_quiet("git checkout main")
+        self.run_cmd_quiet("git pull origin main")
+        self.run_cmd_quiet(f"git checkout -b {branch}")
+        logger.info(f"🌿 Created branch: {branch}")
+        return branch
+
+    def process_task(self, task, arch, files):
+        self.build_state.reset()
+        system_prompt = f"""You are Night Shift Agent, an autonomous coding assistant.
+
+PROJECT ARCHITECTURE:
 {arch}
 
-FILES:
+PROJECT FILES:
 {files}
 
+AVAILABLE TOOLS:
+You must output tool calls as JSON wrapped in <agent_action></agent_action> tags.
+
+1. read_file - Read the contents of a file
+   Args: {{"action": "read_file", "args": {{"path": "path/to/file.kt"}}}}
+   Returns: The file contents as a string
+
+2. write_file - Write content to a file (creates directories if needed)
+   Args: {{"action": "write_file", "args": {{"path": "path/to/file.kt", "content": "file contents here"}}}}
+   Returns: Success or error message
+
+3. replace - Replace text within a file (for small edits)
+   Args: {{"action": "replace", "args": {{"path": "path/to/file.kt", "old_string": "text to find", "new_string": "replacement text"}}}}
+   Returns: Success or error message
+
+4. run_shell - Execute a shell command
+   Args: {{"action": "run_shell", "args": {{"command": "./gradlew assembleDebug"}}}}
+   Returns: Command output (stdout + stderr)
+
+5. list_files - List all files in a directory
+   Args: {{"action": "list_files", "args": {{"path": "."}}}}
+   Returns: Newline-separated list of file paths
+
+WORKFLOW:
+1. Read files to understand the current code
+2. Make changes using write_file or replace
+3. Run './gradlew assembleDebug :composeApp:linkDebugFrameworkIosSimulatorArm64 detekt' to verify
+4. If build fails, read the error and fix your code
+5. Continue until the build passes
+
 RULES:
-1. Create/modify Kotlin source files only
-2. After code changes, run './gradlew assembleDebug :composeApp:linkDebugFrameworkIosSimulatorArm64 detekt' (NOT 'build') - this verifies BOTH Android and iOS
-3. If build fails, fix YOUR CODE (not build files)
-4. Commit when build passes
-5. NEVER modify build.gradle.kts or settings.gradle.kts
-6. VERIFICATION: You explicitly CANNOT assume code works until you see 'run_shell' output "BUILD SUCCESSFUL". You MUST Run 'run_shell' to verify.
-
-TOOL USAGE FORMAT:
-CRITICAL: You are a function-calling agent. You must NOT write conversational text.
-You must ONLY output valid JSON objects to request actions.
-
-CRITICAL: You MUST wrap your JSON response in <agent_action> tags.
-Example:
-<agent_action>
-{{
-  "action": "write_file",
-  "args": {{ "path": "Main.kt", "content": "..." }}
-}}
-</agent_action>
-
-AVAILABLE ACTIONS:
-- read_file(path)
-- write_file(path, content)
-- replace(path, old_string, new_string)
-- list_files(path)
-- run_shell(command)
-
-IMPORTANT: Output a JSON object with the "action" key, wrapped in <agent_action> tags.
+- Output ONE tool call at a time wrapped in <agent_action> tags
+- Wait for tool output before making the next call
+- Always verify your changes compile before considering the task complete
 """
-    
-    base_prompt = system_prompt + f"\n\nTASK: {task}\n\nUSER: Start by searching or reading files. You must output a valid <agent_action>."
-    history_chunks = []
-    
-    consecutive_failures = 0
-    MAX_CONSECUTIVE_FAILURES = 5
-    
-    for iteration in range(MAX_ITERATIONS):
-        logger.info(f"🔄 Iteration {iteration + 1}/{MAX_ITERATIONS}")
+        initial_prompt = system_prompt + f"\nTASK: {task}\n\nBegin by reading the relevant files to understand the current implementation."
         
-        # history pruning
-        current_history = "".join(history_chunks)
-        while len(history_chunks) > 2 and (len(base_prompt) + len(current_history)) > MAX_CONTEXT_CHARS:
-             # Keep the last few turns, drop the oldest
-             dropped = history_chunks.pop(0)
-             current_history = "".join(history_chunks)
-             logger.info(f"✂️ Pruned context: dropped {len(dropped)} chars")
-             
-        full_prompt = base_prompt + current_history
+        prompt_history = []
+        consecutive_failures = 0
 
-        response_text = call_llm_cli(full_prompt)
-        if not response_text:
-            logger.error(f"❌ No response from {AGENT_PROVIDER} CLI")
-            return False
+        for i in range(MAX_ITERATIONS):
+            logger.info(f"🔄 Iteration {i+1}/{MAX_ITERATIONS}")
             
-        current_turn = f"\n\nASSISTANT: {response_text}"
-        
-        # Parse for JSON format tool calls - handle multiple JSON blocks
-        tool_calls_executed = 0
-        if "{" in response_text and "}" in response_text:
-            # Extract all JSON objects from the response
-            json_objects = extract_json_objects(response_text)
-            logger.debug(f"   🔍 Found {len(json_objects)} JSON objects in response")
-            for json_str in json_objects:
+            # Context Pruning
+            full_text = initial_prompt + "".join(prompt_history)
+            while len(prompt_history) > 2 and len(full_text) > MAX_CONTEXT_CHARS:
+                prompt_history.pop(0)
+                full_text = initial_prompt + "".join(prompt_history)
+
+            # LLM Call
+            response = self.llm.ask(full_text)
+            if not response: return False
+            
+            prompt_history.append(f"\n\nASSISTANT: {response}")
+            
+            # Extract Actions
+            actions = re.findall(r'<agent_action>(.*?)</agent_action>', response, re.DOTALL)
+            if not actions and "{" in response: # Fallback regex
+                 actions = re.findall(r'\{[^{}]*\}', response) # Simplified fallback
+            
+            tool_run = False
+            for action_str in actions:
                 try:
-                    data = json.loads(json_str)
-                    # Support 'action' (standard) or 'tool' (legacy) keys
-                    tool_name = data.get("action") or data.get("tool")
+                    clean_action = self.llm.strip_markdown_code_blocks(action_str)
+                    try:
+                        data = json.loads(clean_action)
+                    except json.JSONDecodeError:
+                        # Fallback: finding JSON object inside the string
+                        json_match = re.search(r'\{.*\}', clean_action, re.DOTALL)
+                        if json_match:
+                            data = json.loads(json_match.group(0))
+                        else:
+                            raise
+
+                    tool = data.get("action") or data.get("tool")
                     args = data.get("args", {})
                     
-                    if tool_name:
-                        # Standardize args (file_path -> path, file_content -> content)
-                        if "path" not in args and "file_path" in args:
-                            args["path"] = args.pop("file_path")
-                        if "content" not in args and "file_content" in args:
-                            args["content"] = args.pop("file_content")
-                            
-                        logger.info(f"🛠️ Tool Call: {tool_name}")
-                        logger.debug(f"   🛠️ Args: {str(args)[:200]}...")
-                        
-                        func = available_functions.get(tool_name)
-                        if func:
-                            resp = func(**args)
-                            if len(str(resp)) > 2000: resp = str(resp)[:1000] + f"...[truncated {len(str(resp))-2000} chars]..." + str(resp)[-1000:]
-                            current_turn += f"\n\nTOOL OUTPUT ({tool_name}): {str(resp)}"
-                            tool_calls_executed += 1
-                        else:
-                            logger.warning(f"   ⚠️ Unknown tool: {tool_name}")
-                    else:
-                        logger.debug(f"   🔍 JSON object missing 'tool' or 'args': {list(data.keys())}")
+                    # Handle Gemini's tool_code format: {"tool_code":"func_name(arg1='val', arg2='val')"}
+                    if not tool and "tool_code" in data:
+                        tool_code = data["tool_code"]
+                        # Parse function call syntax: func_name(arg1='value', arg2='value')
+                        match = re.match(r'(\w+)\((.*)\)', tool_code, re.DOTALL)
+                        if match:
+                            tool = match.group(1)
+                            args_str = match.group(2).strip()
+                            # Parse kwargs like: pattern='virtualcard', include='*.kt'
+                            if args_str:
+                                for arg_match in re.finditer(r"(\w+)\s*=\s*['\"]([^'\"]*)['\"]", args_str):
+                                    args[arg_match.group(1)] = arg_match.group(2)
+                            logger.info(f"📝 Parsed tool_code: {tool}({args})")
+                    
+                    # Handle top-level args (Gemini-3-Flash-Preview behavior)
+                    if not args:
+                        args = {k: v for k, v in data.items() if k not in ["action", "tool", "args", "rationale", "thought", "tool_code"]}
+
+                    # Norm args
+                    if "file_path" in args: args["path"] = args.pop("file_path") 
+                    
+                    if tool:
+                        logger.info(f"🛠️ Tool: {tool}")
+                        output = self.toolbox.dispatch(tool, args)
+                        prompt_history.append(f"\n\nTOOL OUTPUT ({tool}): {output}")
+                        tool_run = True
                 except Exception as e:
-                    logger.debug(f"   🔍 Failed to parse JSON object: {e}, content: {json_str[:100]}...")
-        
-        if tool_calls_executed > 0:
-            # Track consecutive build failures
-            if build_state.build_attempted and not build_state.build_passed:
+                    logger.warning(f"Failed to parse action: {e}")
+
+            # If no tools were run and files were changed, model might think it's done
+            # Trigger a verification build automatically
+            if not tool_run and self.build_state.files_changed_since_success:
+                logger.info("🔍 No tool calls detected. Running verification build...")
+                build_output = self.toolbox.run_shell(
+                    "./gradlew assembleDebug :composeApp:linkDebugFrameworkIosSimulatorArm64 detekt"
+                )
+                prompt_history.append(f"\n\nAUTO-VERIFICATION BUILD OUTPUT:\n{build_output}")
+                
+            # Build Failure Logic
+            if tool_run and self.build_state.build_attempted and not self.build_state.build_passed:
                 consecutive_failures += 1
-                logger.warning(f"   ⚠️ Consecutive build failures: {consecutive_failures}/{MAX_CONSECUTIVE_FAILURES}")
-                
-                # Auto-revert after too many consecutive failures
-                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES and build_state.last_successful_files:
-                    logger.warning(f"🔄 AUTO-REVERT: {consecutive_failures} consecutive failures, restoring checkpoint...")
-                    reverted_files = []
-                    for path, content in build_state.last_successful_files.items():
-                        if path in build_state.files_changed_since_success:
-                            try:
-                                with open(path, 'w') as f:
-                                    f.write(content)
-                                reverted_files.append(path)
-                                logger.info(f"   ↩️ Reverted: {path}")
-                            except Exception as e:
-                                logger.error(f"   ❌ Failed to revert {path}: {e}")
-                    
-                    build_state.files_changed_since_success = []
+                if consecutive_failures >= 5:
+                    logger.warning("⚠️ 5 Consecutive failures. Reverting...")
+                    for p, c in self.build_state.last_successful_files.items():
+                        self.toolbox.write_file(path=p, content=c)
                     consecutive_failures = 0
-                    
-                    if reverted_files:
-                        current_turn += f"\n\nSYSTEM: Auto-reverted {len(reverted_files)} files to last working state due to repeated failures. Files: {reverted_files}. Try a simpler approach."
-                        logger.info(f"📸 Reverted {len(reverted_files)} files to checkpoint. Agent notified to try simpler approach.")
-            elif build_state.build_attempted and build_state.build_passed:
-                consecutive_failures = 0  # Reset on success
             
-            if build_state.is_verified():
-                logger.info("✅ Build verified (triggered by tool execution)")
+            # Check Success (Build Passed + User Task satisfied implies we should commit)
+            # Simplified: If build passed this turn, commit.
+            if self.build_state.build_passed and self.build_state.is_verified():
+                logger.info("✅ Build Passed. Committing...")
+                # Commit & Push logic here (simplified for refactor brevity)
+                subprocess.run("git add .", shell=True)
+                safe_task = task.replace('"', '\\"')
+                subprocess.run(f'git commit -m "Fix: {safe_task}"', shell=True)
+                current_branch = subprocess.getoutput("git rev-parse --abbrev-ref HEAD")
+                subprocess.run(f"git push -u origin {current_branch}", shell=True)
+                subprocess.run("gh pr create --fill", shell=True)
                 return True
-            else:
-                # Tool ran, but didn't verify. Warn the agent to run the actual build command.
-                current_turn += "\n\nSYSTEM: You executed a tool, but the build is NOT verified. To complete the task, you MUST run the verification command: ./gradlew assembleDebug :composeApp:linkDebugFrameworkIosSimulatorArm64 detekt"
-
-            history_chunks.append(current_turn)
-            continue  # Continue to next iteration after processing tool calls
-        else:
-            # No tool calls detected - prompt the agent to act
-            logger.warning("⚠️ No tool calls detected in response")
-            current_turn += "\n\nSYSTEM: ERROR: No tool execution detected. You have NOT verified the build in this session. You MUST output a JSON tool call to run: ./gradlew assembleDebug :composeApp:linkDebugFrameworkIosSimulatorArm64 detekt"
-
-        logger.info(f"\n🧠 Agent Report:\n{response_text}")
-        if build_state.is_verified():
-            logger.info("✅ Build verified")
-            return True
-        current_turn += "\n\nUSER: System: Run 'run_shell(\"./gradlew assembleDebug :composeApp:linkDebugFrameworkIosSimulatorArm64 detekt\")' to verify."
-        history_chunks.append(current_turn)
-    return False
-
-def fix_ci_failure(branch_name: str, arch: str, files: str) -> bool:
-    global build_state
-    build_state.reset()
-    logs = get_pr_check_logs(branch_name)
-    
-    base_prompt = f"""You are Night Shift Agent.
-CI Failed for branch {branch_name}.
-Logs:
-{logs}
-
-TOOL USAGE: OUTPUT JSON {{ "tool": "name", "args": {{...}} }}
-TOOLS: read_file, write_file, list_files, run_shell
-
-Fix code (not build files), then run './gradlew assembleDebug :composeApp:linkDebugFrameworkIosSimulatorArm64 detekt' to verify BOTH Android and iOS.
-"""
-    history_chunks = []
-
-    for _ in range(MAX_ITERATIONS):
-        # history pruning
-        current_history = "".join(history_chunks)
-        while len(history_chunks) > 2 and (len(base_prompt) + len(current_history)) > MAX_CONTEXT_CHARS:
-             dropped = history_chunks.pop(0)
-             current_history = "".join(history_chunks)
         
-        full_prompt = base_prompt + current_history
+        return False
+
+    def run(self):
+        logger.info(f"🚀 Starting Agent in {self.project_dir}")
+        self.configure_git()
         
-        response_text = call_llm_cli(full_prompt)
-        if not response_text: return False
-        
-        current_turn = f"\n\nASSISTANT: {response_text}"
-        
-        # Parse for JSON format tool calls - handle multiple JSON blocks
-        tool_calls_executed = 0
-        if "{" in response_text and "}" in response_text:
-            json_objects = extract_json_objects(response_text)
-            for json_str in json_objects:
-                try:
-                    data = json.loads(json_str)
-                    if "tool" in data and "args" in data:
-                        tool_name = data["tool"]
-                        tool_args = data["args"]
-                        logger.info(f"🛠️ Tool Call: {tool_name}")
-                        func = available_functions.get(tool_name)
-                        if func:
-                            resp = func(**tool_args)
-                            current_turn += f"\n\nTOOL OUTPUT ({tool_name}): {str(resp)[:2000]}"
-                            tool_calls_executed += 1
-                except: pass
-        
-        if tool_calls_executed > 0:
-            history_chunks.append(current_turn)
-            continue  # Continue to next iteration after processing tool calls
+        tasks_file = self.project_dir / "tasks.txt"
+        if not tasks_file.exists():
+            return
             
-        if build_state.is_verified(): return True
-        current_turn += "\n\nUSER: Run './gradlew assembleDebug :composeApp:linkDebugFrameworkIosSimulatorArm64 detekt'."
-        history_chunks.append(current_turn)
-    return False
+        with open(tasks_file) as f: tasks = [l.strip() for l in f if l.strip() and not l.startswith("[x]")]
+        
+        if not tasks: return
 
-# =============================================================================
-# MAIN
-# =============================================================================
+        branch = self.create_branch()
+        
+        # Get project architecture - try tree, fall back to find
+        arch_output = self.toolbox.run_shell("tree -L 2 -I 'build|.*' 2>/dev/null || find . -maxdepth 2 -type d ! -path '*/.*' ! -path './build*' 2>/dev/null | head -50")
+        
+        # Also read ARCHITECTURE.md if it exists for richer context
+        arch_doc = self.project_dir / "docs" / "ARCHITECTURE.md"
+        if arch_doc.exists():
+            try:
+                arch_content = arch_doc.read_text()
+                arch_output = f"=== Directory Structure ===\n{arch_output}\n\n=== ARCHITECTURE.md ===\n{arch_content}"
+            except Exception as e:
+                logger.warning(f"Failed to read ARCHITECTURE.md: {e}")
+        
+        files = self.toolbox.list_files()
 
-def main():
-    logger.info("""
-    ╔══════════════════════════════════════════════════════════════╗
-    ║  🌙 Night Shift Agent v3.6                                   ║
-    ║  Autonomous Coding Assistant with Direct Push Workflow       ║
-    ╚══════════════════════════════════════════════════════════════╝
-    """)
-    
-    if not GH_BOT_TOKEN:
-        logger.warning("⚠️ GH_BOT_TOKEN not set - git operations may fail")
-    
-    logger.info(f"📁 Project: {PROJECT_DIR}")
-    logger.info(f"🤖 Provider: {AGENT_PROVIDER}, Model: {AGENT_MODEL}")
-    logger.info(f"📝 Log file: {LOG_FILE}")
-    
-    arch = read_file("ARCHITECTURE.md") if os.path.exists("ARCHITECTURE.md") else ""
-    files = list_files()
-    
-    if not os.path.exists("tasks.txt"):
-        logger.warning("⚠️ No tasks.txt found")
-        return
-    
-    if not setup_origin_with_bot_token():
-        logger.error("❌ Failed to configure git")
-        sys.exit(1)
-    
-    feature_branch = create_feature_branch()
-    
-    while True:
-        with open("tasks.txt", "r") as f: lines = f.readlines()
-        task_index = -1
-        current_task = ""
-        for i, line in enumerate(lines):
-            stripped = line.strip()
-            if stripped and not any(stripped.startswith(p) for p in ["[x]", "[!]", "#"]):
-                task_index = i
-                current_task = stripped
-                break
-        if task_index == -1:
-            logger.info("📋 No more tasks to process")
-            break
-        
-        logger.info(f"\n{'='*60}")
-        logger.info(f"▶️ Processing Task {task_index + 1}: {current_task}")
-        logger.info(f"{'='*60}")
-        
-        if process_task(current_task, arch, files):
-            lines[task_index] = f"[x] {lines[task_index].lstrip()}"
-            logger.info(f"✅ Done: {current_task}")
-        else:
-            lines[task_index] = f"[!] {lines[task_index].lstrip()}"
-            logger.error(f"❌ Failed: {current_task}")
-        
-        with open("tasks.txt", "w") as f: f.writelines(lines)
-        time.sleep(2)
-    
-    with open("tasks.txt", "r") as f: final_lines = f.readlines()
-    tasks_succeeded = sum(1 for l in final_lines if l.startswith("[x]"))
-    tasks_failed = sum(1 for l in final_lines if l.startswith("[!]"))
-    completed = [l.replace("[x]", "").strip() for l in final_lines if l.startswith("[x]")]
-    failed = [l.replace("[!]", "").strip() for l in final_lines if l.startswith("[!]")]
-    
-    # Log accurate task summary
-    if tasks_failed > 0:
-        logger.warning(f"⚠️ Task Summary: {tasks_succeeded} succeeded, {tasks_failed} failed")
-    else:
-        logger.info(f"✅ All {tasks_succeeded} tasks completed successfully!")
-    
-    if tasks_succeeded == 0:
-        logger.warning("⚠️ No tasks completed successfully. Skipping PR.")
-        run_cmd("git checkout main")
-        return
-    
-    logger.info("\n" + "="*60)
-    logger.info("📤 Creating Pull Request")
-    logger.info("="*60)
-    
-    # Commit all changes
-    logger.info("📝 Committing changes...")
-    run_cmd("git add -A")
-    # Sanitize task names for commit message (remove quotes, limit length)
-    def sanitize_task(t):
-        return t.replace('"', '').replace("'", "")[:50]
-    safe_tasks = [sanitize_task(t) for t in completed[:3]]
-    commit_msg = f"🌙 Night Shift: {', '.join(safe_tasks)}{'...' if len(completed) > 3 else ''}"
-    # Use single quotes for outer shell and escape any single quotes in message
-    escaped_msg = commit_msg.replace("'", "'\"'\"'")
-    success, output = run_cmd(f"git commit -m '{escaped_msg}'")
-    if not success and "nothing to commit" in output:
-        logger.warning("⚠️ No changes to commit")
-    elif not success:
-        logger.error(f"❌ Failed to commit: {output}")
-        return
-    else:
-        logger.info("✅ Changes committed")
-    
-    if not push_branch(feature_branch):
-        logger.error("❌ Failed to push")
-        return
-    
-    pr_title = f"🌙 Night Shift: {tasks_succeeded} task(s)" + (f" ({tasks_failed} failed)" if tasks_failed > 0 else "")
-    pr_body = f"## 🌙 Night Shift Agent Report\n\n**Succeeded**: {tasks_succeeded}\n**Failed**: {tasks_failed}\n\n### ✅ Completed\n" + "\n".join([f"- [x] {t}" for t in completed])
-    if failed:
-        pr_body += "\n\n### ❌ Failed\n" + "\n".join([f"- [ ] {t}" for t in failed])
-    
-    pr_success, pr_url = create_pull_request(feature_branch, pr_title, pr_body)
-    if not pr_success:
-        logger.error(f"❌ Failed to create PR: {pr_url}")
-        return
-    
-    logger.info(f"✅ PR Created: {pr_url}")
-    
-    logger.info("\n" + "="*60)
-    logger.info("🔍 Monitoring CI Status (will wait up to 30 minutes)")
-    logger.info("="*60)
-    
-    MAX_CI_WAIT_POLLS = 30
-    ci_passed = False
-    
-    for poll in range(MAX_CI_WAIT_POLLS):
-        logger.info(f"⏳ Poll {poll + 1}/{MAX_CI_WAIT_POLLS}: Waiting {CI_POLL_INTERVAL}s for CI...")
-        time.sleep(CI_POLL_INTERVAL)
-        
-        status = get_pr_status(feature_branch)
-        if not status.get("success"):
-            logger.info("⏳ Could not get status, retrying...")
-            continue
-        
-        if status.get("pending"):
-            logger.info("⏳ CI still running...")
-            
-            # Check if merged while running
-            if is_pr_merged(feature_branch):
-                logger.info("🎉 PR Merged! Stopping monitor.")
-                ci_passed = True
-                break
-                
-            continue
-        
-        if status.get("all_passed"):
-            logger.info("🎉 ALL CI CHECKS PASSED!")
-            ci_passed = True
-            break
-        
-        if status.get("any_failed"):
-            logger.warning(f"❌ CI failed! Attempting fix...")
-            if fix_ci_failure(feature_branch, arch, files):
-                push_branch(feature_branch)
-                logger.info("📤 Pushed CI fix, waiting for new run...")
-            else:
-                logger.error("❌ Could not fix CI failure")
-    
-    # Final Summary
-    logger.info("\n" + "="*60)
-    logger.info("📊 FINAL SESSION SUMMARY")
-    logger.info("="*60)
-    logger.info(f"   Tasks succeeded: {tasks_succeeded}")
-    if tasks_failed > 0:
-        logger.warning(f"   Tasks failed: {tasks_failed}")
-    logger.info(f"   PR URL: {pr_url}")
-    
-    if ci_passed:
-        logger.info("   CI Status: ✅ ALL CHECKS PASSED - PR IS READY TO MERGE!")
-    else:
-        logger.warning("   CI Status: ⚠️ CI did not complete successfully")
-        logger.warning("   Manual review may be required")
-    
-    logger.info("="*60)
-    
-    run_cmd("git checkout main")
+        for task in tasks:
+            logger.info(f"▶️ Processing: {task}")
+            # Clean task string handling
+            clean_task = task.replace("[ ]", "").replace("[!]", "").strip()
+            if self.process_task(clean_task, arch_output, files):
+                # Mark done
+                content = open(tasks_file).read().replace(task, f"[x] {clean_task}")
+                open(tasks_file, "w").write(content)
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--project-dir', default='.')
+    args = parser.parse_args()
+    
+    agent = NightShiftAgent(args.project_dir)
+    agent.run()
