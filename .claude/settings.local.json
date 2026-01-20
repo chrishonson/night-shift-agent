@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(gemini:*)",
-      "Bash(python agent_gemini.py:*)"
+      "Bash(python agent_gemini.py:*)",
+      "Bash(ls:*)"
     ]
   }
 }

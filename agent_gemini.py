@@ -122,12 +122,27 @@ class RateLimiter:
 # LLM CLIENT (FAILOVER LOGIC)
 # =============================================================================
 
-class LLMClient:
-    """Handles communication with LLM CLIs including failover logic."""
-    def __init__(self):
-        self.provider = os.getenv("PREFERRED_AGENT_PROVIDER", DEFAULT_PROVIDER)
-        self.model = os.getenv("PREFERRED_AGENT_MODEL", DEFAULT_MODEL_GEMINI if self.provider == "gemini" else "")
+# =============================================================================
+# LLM PROVIDER ABSTRACTION
+# =============================================================================
+
+from abc import ABC, abstractmethod
+from typing import List, Optional
+
+class LLMProvider(ABC):
+    """Abstract base class for LLM providers (CLI or API)."""
     
+    @abstractmethod
+    def ask(self, prompt: str) -> Optional[str]:
+        """Sends prompt to the model and returns text response."""
+        pass
+        
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        """Friendly name for logging."""
+        pass
+        
     def strip_markdown_code_blocks(self, text: str) -> str:
         text = text.strip()
         if text.startswith("```"):
@@ -137,101 +152,85 @@ class LLMClient:
             return '\n'.join(lines).strip()
         return text
 
-    def call_gemini(self, prompt: str):
-        logger.info(f"🤖 Calling Gemini CLI... (Model: {self.model})")
+class GeminiCLIProvider(LLMProvider):
+    def __init__(self, model=DEFAULT_MODEL_GEMINI):
+        self.model = model
         
-        # Log the outgoing prompt
+    @property
+    def name(self): return f"Gemini CLI ({self.model})"
+
+    def ask(self, prompt: str) -> Optional[str]:
         prompt_logger.debug(
-            f"{'='*80}\n"
-            f">>> PROMPT TO GEMINI (Model: {self.model})\n"
-            f"{'='*80}\n"
-            f"{prompt}\n"
-            f"{'='*80}\n"
+            f"{'='*80}\n>>> PROMPT TO {self.name}\n{'='*80}\n{prompt}\n{'='*80}\n"
         )
         
         for attempt in range(MAX_RETRIES):
             try:
-                # Use JSON output for structure reliability
-                # --sandbox false disables CLI's internal tools so it acts as pure text generator
-                # Pass prompt as positional argument (stdin/--prompt is deprecated)
+                # --sandbox false disables internal tools, --output-format json enforces structure
                 result = subprocess.run(
                     ["gemini", "--model", self.model, "--sandbox", "false", "--output-format", "json", prompt],
                     capture_output=True, text=True, timeout=300
                 )
                 
-                # Log the raw CLI response
-                prompt_logger.debug(
-                    f"{'='*80}\n"
-                    f"<<< RAW RESPONSE FROM GEMINI (Attempt {attempt+1}, Return Code: {result.returncode})\n"
-                    f"{'='*80}\n"
-                    f"STDOUT:\n{result.stdout}\n"
-                    f"{'~'*40}\n"
-                    f"STDERR:\n{result.stderr}\n"
-                    f"{'='*80}\n"
-                )
+                self._log_raw_response(attempt, result)
+                self._check_quota(result.stderr)
                 
-                # Check Quota - only check stderr for errors, not stdout which may contain session IDs with 429 substring
-                stderr_lower = result.stderr.lower()
-                if any(x in stderr_lower for x in ["quota exceeded", "resource exhausted", "rate limit"]):
-                    logger.error("🚨 Gemini Quota Exceeded!")
-                    raise QuotaExceededError("Gemini Quota Exceeded")
-                # Also check for explicit HTTP 429 status code pattern in stderr
-                if "429" in stderr_lower and ("error" in stderr_lower or "too many" in stderr_lower):
-                    logger.error("🚨 Gemini Rate Limited (429)!")
-                    raise QuotaExceededError("Gemini Rate Limited")
-
-                # Parse JSON Output
                 if result.returncode == 0 and result.stdout.strip():
-                    try:
-                        data = json.loads(result.stdout.strip())
-                        # Handle potential list or single object
-                        if isinstance(data, list): data = data[0]
-                        
-                        # Extract content based on CLI schema (usually "response" or "content")
-                        # Adjust structure based on actual CLI output verification
-                        response_text = data.get("response") or data.get("content") or json.dumps(data)
-                        parsed_response = self.strip_markdown_code_blocks(response_text)
-                        
-                        # Log the parsed response
-                        prompt_logger.debug(
-                            f"{'='*80}\n"
-                            f"<<< PARSED RESPONSE FROM GEMINI\n"
-                            f"{'='*80}\n"
-                            f"{parsed_response}\n"
-                            f"{'='*80}\n"
-                        )
-                        return parsed_response
-                    except json.JSONDecodeError:
-                         logger.warning(f"⚠️ Failed to parse CLI JSON: {result.stdout[:200]}")
+                    return self._parse_json_response(result.stdout)
                 
                 if result.returncode != 0:
-                    logger.warning(f"⚠️ CLI Error ({attempt+1}/{MAX_RETRIES}): {result.stderr}")
-                    if attempt < MAX_RETRIES - 1:
-                        time.sleep(RETRY_BASE_DELAY * (2 ** attempt))
-                        continue
-                    return None
-                
-                # Fallback if no JSON but success (shouldn't happen with -o json)
-                return self.strip_markdown_code_blocks(result.stdout.strip())
-
+                    logger.warning(f"⚠️ {self.name} Error ({attempt+1}/{MAX_RETRIES}): {result.stderr}")
+                    self._backoff(attempt)
+                    
             except QuotaExceededError:
                 raise
             except Exception as e:
-                logger.warning(f"⚠️ CLI Exception ({attempt+1}/{MAX_RETRIES}): {e}")
-                if attempt < MAX_RETRIES - 1: time.sleep(RETRY_BASE_DELAY * (2 ** attempt))
-                else: return None
+                logger.warning(f"⚠️ {self.name} Exception ({attempt+1}/{MAX_RETRIES}): {e}")
+                self._backoff(attempt)
         return None
 
-    def call_claude(self, prompt: str):
-        logger.info(f"🤖 Calling Claude CLI... (Model: {self.model})")
-        
-        # Log the outgoing prompt
+    def _log_raw_response(self, attempt, result):
         prompt_logger.debug(
-            f"{'='*80}\n"
-            f">>> PROMPT TO CLAUDE (Model: {self.model or 'default'})\n"
-            f"{'='*80}\n"
-            f"{prompt}\n"
-            f"{'='*80}\n"
+            f"{'='*80}\n<<< RAW RESPONSE ({attempt+1}) RC:{result.returncode}\n{'='*80}\n"
+            f"STDOUT:\n{result.stdout}\n{'~'*40}\nSTDERR:\n{result.stderr}\n{'='*80}\n"
+        )
+
+    def _check_quota(self, stderr):
+        lower_err = stderr.lower()
+        if any(x in lower_err for x in ["quota exceeded", "resource exhausted", "rate limit"]):
+            logger.error(f"🚨 {self.name} Quota Exceeded!")
+            raise QuotaExceededError(f"{self.name} Quota Exceeded")
+        if "429" in lower_err and ("error" in lower_err or "too many" in lower_err):
+            logger.error(f"🚨 {self.name} Rate Limited (429)!")
+            raise QuotaExceededError(f"{self.name} Rate Limited")
+
+    def _parse_json_response(self, stdout):
+        try:
+            data = json.loads(stdout.strip())
+            if isinstance(data, list): data = data[0]
+            # Extract content from various potential CLI JSON schemas
+            response_text = data.get("response") or data.get("content") or json.dumps(data)
+            parsed = self.strip_markdown_code_blocks(response_text)
+            prompt_logger.debug(f"{'='*80}\n<<< PARSED RESPONSE\n{'='*80}\n{parsed}\n{'='*80}\n")
+            return parsed
+        except json.JSONDecodeError:
+             logger.warning(f"⚠️ Failed to parse JSON: {stdout[:200]}")
+             return None
+
+    def _backoff(self, attempt):
+        if attempt < MAX_RETRIES - 1:
+            time.sleep(RETRY_BASE_DELAY * (2 ** attempt))
+
+class ClaudeCLIProvider(LLMProvider):
+    def __init__(self, model=""):
+        self.model = model
+        
+    @property
+    def name(self): return f"Claude CLI ({self.model or 'default'})"
+
+    def ask(self, prompt: str) -> Optional[str]:
+        prompt_logger.debug(
+            f"{'='*80}\n>>> PROMPT TO {self.name}\n{'='*80}\n{prompt}\n{'='*80}\n"
         )
         
         for attempt in range(MAX_RETRIES):
@@ -246,77 +245,176 @@ class LLMClient:
                     cmd = f"cat {temp_path} | claude -p {model_arg} --dangerously-skip-permissions"
                     result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=300)
                     
-                    # Log the raw CLI response
-                    prompt_logger.debug(
-                        f"{'='*80}\n"
-                        f"<<< RAW RESPONSE FROM CLAUDE (Attempt {attempt+1}, Return Code: {result.returncode})\n"
-                        f"{'='*80}\n"
-                        f"STDOUT:\n{result.stdout}\n"
-                        f"{'~'*40}\n"
-                        f"STDERR:\n{result.stderr}\n"
-                        f"{'='*80}\n"
-                    )
-
-                    # Check Quota
-                    combined = (result.stdout + result.stderr).lower()
-                    if any(x in combined for x in ["hit your limit", "rate limit"]):
-                        logger.error("🚨 Claude Quota Exceeded!")
-                        raise QuotaExceededError("Claude Quota Exceeded")
+                    self._log_raw_response(attempt, result)
+                    self._check_quota(result.stdout + result.stderr)
 
                     if result.returncode != 0:
-                        logger.warning(f"⚠️ CLI Error ({attempt+1}/{MAX_RETRIES}): {result.stderr}")
-                        if attempt < MAX_RETRIES - 1:
-                            time.sleep(RETRY_BASE_DELAY * (2 ** attempt))
-                            continue
-                        return None
+                        logger.warning(f"⚠️ {self.name} Error ({attempt+1}/{MAX_RETRIES}): {result.stderr}")
+                        self._backoff(attempt)
+                        continue
                     
-                    parsed_response = self.strip_markdown_code_blocks(result.stdout.strip())
+                    parsed = self.strip_markdown_code_blocks(result.stdout.strip())
+                    prompt_logger.debug(f"{'='*80}\n<<< PARSED RESPONSE\n{'='*80}\n{parsed}\n{'='*80}\n")
+                    return parsed
                     
-                    # Log the parsed response
-                    prompt_logger.debug(
-                        f"{'='*80}\n"
-                        f"<<< PARSED RESPONSE FROM CLAUDE\n"
-                        f"{'='*80}\n"
-                        f"{parsed_response}\n"
-                        f"{'='*80}\n"
-                    )
-                    return parsed_response
                 finally:
                     if os.path.exists(temp_path): os.unlink(temp_path)
 
             except QuotaExceededError:
                 raise
             except Exception as e:
-                logger.warning(f"⚠️ CLI Exception ({attempt+1}/{MAX_RETRIES}): {e}")
-                if attempt < MAX_RETRIES - 1: time.sleep(RETRY_BASE_DELAY * (2 ** attempt))
-                else: return None
+                logger.warning(f"⚠️ {self.name} Exception ({attempt+1}/{MAX_RETRIES}): {e}")
+                self._backoff(attempt)
         return None
 
-    def ask(self, prompt: str):
-        """Main entry point with failover."""
-        original_provider = self.provider
-        while True:
-            try:
-                if self.provider == "claude":
-                    return self.call_claude(prompt)
-                else:
-                    return self.call_gemini(prompt)
-            except QuotaExceededError:
-                logger.warning(f"🛑 {self.provider.title()} Quota Exceeded. Switching...")
-                
-                # Switch
-                if self.provider == "claude":
-                    self.provider = "gemini"
-                    self.model = DEFAULT_MODEL_GEMINI
-                else:
-                    self.provider = "claude"
-                    self.model = "" # Default
+    def _log_raw_response(self, attempt, result):
+        prompt_logger.debug(
+            f"{'='*80}\n<<< RAW RESPONSE ({attempt+1}) RC:{result.returncode}\n{'='*80}\n"
+            f"STDOUT:\n{result.stdout}\n{'~'*40}\nSTDERR:\n{result.stderr}\n{'='*80}\n"
+        )
 
-                if self.provider == original_provider:
-                    logger.error("❌ Both providers exhausted! Stopping.")
-                    return None
+    def _check_quota(self, combined_output):
+        lower = combined_output.lower()
+        if any(x in lower for x in ["hit your limit", "rate limit", "quota exceeded"]):
+            logger.error(f"🚨 {self.name} Quota Exceeded!")
+            raise QuotaExceededError(f"{self.name} Quota Exceeded")
+
+    def _backoff(self, attempt):
+        if attempt < MAX_RETRIES - 1:
+            time.sleep(RETRY_BASE_DELAY * (2 ** attempt))
+
+class OpenRouterAPIProvider(LLMProvider):
+    def __init__(self, model="google/gemini-2.0-flash-exp:free"):
+        self.model = model
+        self.api_key = os.getenv("OPENROUTER_API_KEY")
+        
+    @property
+    def name(self): return f"OpenRouter API ({self.model})"
+
+    def ask(self, prompt: str) -> Optional[str]:
+        if not self.api_key:
+            logger.info(f"⏭️ Skipping {self.name}: OPENROUTER_API_KEY not set")
+            raise QuotaExceededError("OpenRouter Key Missing") # Treat as unavailable
+
+        prompt_logger.debug(
+            f"{'='*80}\n>>> PROMPT TO {self.name}\n{'='*80}\n{prompt}\n{'='*80}\n"
+        )
+        
+        # We need generic requests, but trying to avoid external deps if possible.
+        # But for OpenRouter, curl/requests is needed. Let's use standard lib urllib to avoid forcing 'requests' install.
+        import urllib.request
+        import json
+        
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://github.com/chrishonson/night-shift-agent",
+        }
+        data = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}]
+        }
+        
+        for attempt in range(MAX_RETRIES):
+            try:
+                req = urllib.request.Request(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    headers=headers,
+                    data=json.dumps(data).encode('utf-8')
+                )
                 
-                logger.info(f"🔄 Switched to {self.provider.title()}. Retrying...")
+                with urllib.request.urlopen(req, timeout=60) as response:
+                    resp_body = response.read().decode('utf-8')
+                    # Log raw
+                    self._log_raw_response(attempt, 200, resp_body)
+                    
+                    data = json.loads(resp_body)
+                    if "error" in data:
+                         # Check for rate limits in API error
+                         err_msg = json.dumps(data['error']).lower()
+                         if "rate limit" in err_msg or "quota" in err_msg or "insufficient" in err_msg:
+                             raise QuotaExceededError(err_msg)
+                         raise Exception(f"OpenRouter Error: {err_msg}")
+                         
+                    content = data['choices'][0]['message']['content']
+                    parsed = self.strip_markdown_code_blocks(content)
+                    prompt_logger.debug(f"{'='*80}\n<<< PARSED RESPONSE\n{'='*80}\n{parsed}\n{'='*80}\n")
+                    return parsed
+
+            except urllib.error.HTTPError as e:
+                err_text = e.read().decode('utf-8')
+                self._log_raw_response(attempt, e.code, err_text)
+                if e.code == 429:
+                    raise QuotaExceededError("OpenRouter 429")
+                logger.warning(f"⚠️ {self.name} HTTP Error {e.code}: {err_text}")
+                self._backoff(attempt)
+            except Exception as e:
+                logger.warning(f"⚠️ {self.name} Exception: {e}")
+                self._backoff(attempt)
+        return None
+
+    def _log_raw_response(self, attempt, status, text):
+        prompt_logger.debug(
+            f"{'='*80}\n<<< RAW RESPONSE ({attempt+1}) Status:{status}\n{'='*80}\n"
+            f"{text}\n{'='*80}\n"
+        )
+    
+    def _backoff(self, attempt):
+        if attempt < MAX_RETRIES - 1:
+            time.sleep(RETRY_BASE_DELAY * (2 ** attempt))
+
+class ProviderManager:
+    """Manages a list of providers and handles failover."""
+    def __init__(self):
+        self.providers: List[LLMProvider] = []
+        self._init_providers()
+        
+    def _init_providers(self):
+        # Determine order based on env preference
+        preferred = os.getenv("PREFERRED_AGENT_PROVIDER", "gemini")
+        gemini_model = os.getenv("PREFERRED_AGENT_MODEL", DEFAULT_MODEL_GEMINI)
+        
+        p1 = GeminiCLIProvider(gemini_model)
+        p2 = ClaudeCLIProvider() # Default claude model
+        p3 = OpenRouterAPIProvider() # Fallback to openrouter
+        
+        if preferred == "claude":
+            self.providers = [p2, p1, p3]
+        elif preferred == "openrouter":
+            self.providers = [p3, p1, p2]
+        else:
+            self.providers = [p1, p2, p3]
+            
+        logger.info(f"🔌 Provider Chain: {[p.name for p in self.providers]}")
+
+    def ask(self, prompt: str) -> Optional[str]:
+        for i, provider in enumerate(self.providers):
+            try:
+                return provider.ask(prompt)
+            except QuotaExceededError:
+                logger.warning(f"🛑 {provider.name} Quota/Key Limit. Switching...")
+                if i < len(self.providers) - 1:
+                    logger.info(f"🔄 Switching to next provider: {self.providers[i+1].name}...")
+                    continue
+                else:
+                    logger.error("❌ All providers exhausted!")
+                    return None
+            except Exception as e:
+                logger.error(f"❌ Critical error in {provider.name}: {e}")
+                # Optional: Failover on crash too? For now, yes.
+                if i < len(self.providers) - 1: continue
+                return None
+        return None
+
+    def strip_markdown_code_blocks(self, text: str) -> str:
+        text = text.strip()
+        if text.startswith("```"):
+            lines = text.split('\n')
+            if lines[0].startswith("```"): lines = lines[1:]
+            if lines and lines[-1].strip() == "```": lines = lines[:-1]
+            return '\n'.join(lines).strip()
+        return text
+
 
 # =============================================================================
 # TOOLBOX
@@ -368,8 +466,10 @@ class Toolbox:
         try:
             result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=600, env=env)
             
-            # Simple build detection
-            if any(x in command for x in ["./gradlew", "gradlew", "gradle "]):
+            # Build detection - check command start to avoid false positives (e.g., ".gradle" in grep)
+            cmd_stripped = command.strip()
+            is_gradle_build = any(cmd_stripped.startswith(x) for x in ["./gradlew", "gradlew ", "gradle "])
+            if is_gradle_build:
                 self.build_state.build_attempted = True
                 self.build_state.build_passed = (result.returncode == 0)
                 if result.returncode == 0:
@@ -470,7 +570,7 @@ class NightShiftAgent:
         
         self.build_state = BuildState()
         self.toolbox = Toolbox(self.build_state)
-        self.llm = LLMClient()
+        self.llm = ProviderManager()
         self.bot_username = os.getenv("BOT_USERNAME", "agentnightshift")
         self.gh_token = os.getenv("GH_BOT_TOKEN")
     
