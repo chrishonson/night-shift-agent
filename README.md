@@ -1,8 +1,8 @@
-# 🌙 Night Shift Agent
+# 🌙 Night Shift Agent v3.6
 
 > **An AI-powered autonomous coding assistant that works while you sleep.**
 
-Night Shift Agent is a Python-based autonomous coding agent powered by **Gemini AI**. It reads a task list, writes code, verifies builds, creates pull requests, and monitors CI—all without human intervention.
+Night Shift Agent is a Python-based autonomous coding agent powered by **Gemini AI** (with **Claude AI** failover). It reads a task list, writes code, verifies builds, creates pull requests, and monitors CI—all without human intervention.
 
 ## Why Night Shift?
 
@@ -38,39 +38,37 @@ python agent_gemini.py --project-dir /path/to/your/project
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                     🌙 Night Shift Agent                        │
+│                   🌙 Night Shift Agent v3.6                     │
 │                                                                 │
-│   tasks.txt ──▶ Gemini AI ──▶ Code Changes ──▶ PR + CI Monitor  │
-│                     │                                           │
-│              ┌──────┴──────┐                                    │
-│              │   4 Tools   │                                    │
-│              ├─────────────┤                                    │
-│              │ read_file   │                                    │
-│              │ write_file  │                                    │
-│              │ list_files  │                                    │
-│              │ run_shell   │                                    │
-│              └─────────────┘                                    │
+│   tasks.txt ──▶ LLM (Gemini/Claude) ──▶ Code Changes ──▶ PR     │
+│                        │                                        │
+│              ┌─────────┴─────────┐                              │
+│              │      5 Tools      │                              │
+│              ├───────────────────┤                              │
+│              │ read_file         │                              │
+│              │ write_file        │                              │
+│              │ replace           │                              │
+│              │ list_files        │                              │
+│              │ run_shell         │                              │
+│              └───────────────────┘                              │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
 The agent operates in a loop:
-1. **Check** for existing open PRs from previous runs
-2. **Read** the next task from `tasks.txt`
-3. **Understand** the codebase using `list_files` and `read_file`
-4. **Write** code changes with `write_file`
-5. **Verify** the build with your project's build command
-6. **Commit** when verification passes
-7. **Repeat** until all tasks are complete
-8. **Push** and create/update Pull Request
-9. **Monitor** CI, auto-fixing failures when possible
+1. **Read** the next uncompleted task from `tasks.txt`
+2. **Understand** the codebase using `list_files` and `read_file`
+3. **Write** code changes with `write_file` or `replace`
+4. **Verify** the build with your project's build command
+5. **Commit** when verification passes
+6. **Repeat** until all tasks are complete
+7. **Push** and create Pull Request
 
-### PR Continuity
+### LLM Provider Failover
 
-If you stop the agent and restart it later, it will:
-- **Find your existing open PR** from a previous run
-- **Check out that branch** instead of creating a new one
-- **Continue working** on the same PR
-- **Read any feedback comments** you left on the PR
+The agent supports **automatic failover** between LLM providers:
+- If **Gemini** hits a rate limit or quota, it automatically switches to **Claude**
+- If **Claude** is also exhausted, the agent stops gracefully
+- You can set your preferred starting provider via environment variables
 
 ---
 
@@ -82,9 +80,10 @@ Create a `.env` file (copy from `.env.example`):
 # Required
 GH_BOT_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxx  # GitHub PAT with repo access
 
-# Optional
-BOT_USERNAME=agentnightshift           # Git commit author (default: agentnightshift)
-AGENT_MODEL=gemini-3-flash-preview     # Gemini model (default: gemini-3-flash-preview)
+# Optional - Agent Configuration
+BOT_USERNAME=agentnightshift             # Git commit author (default: agentnightshift)
+PREFERRED_AGENT_PROVIDER=gemini          # LLM provider: "gemini" or "claude" (default: gemini)
+PREFERRED_AGENT_MODEL=gemini-3-flash-preview  # Model name (default: gemini-3-flash-preview)
 ```
 
 ### GitHub Token Permissions
@@ -138,14 +137,21 @@ Session logs are saved to `.agent_logs/` in the project directory:
 
 ```
 .agent_logs/
-├── session_20251225_144005.log
-├── session_20251225_153012.log
+├── session_20251225_144005.log    # Main agent activity log
+├── prompts_20251225_144005.log    # Full LLM prompts & responses
 └── ...
 ```
 
+### Log Types
+
+| File | Contents |
+|------|----------|
+| `session_*.log` | Agent operations, tool calls, build results |
+| `prompts_*.log` | Complete LLM conversations (useful for debugging) |
+
 ---
 
-## �️ Reliability Features
+## 🛡️ Reliability Features
 
 The agent includes several safeguards to prevent runaway failures:
 
@@ -207,16 +213,34 @@ See [kmp-agentic-ci-template](https://github.com/chrishonson/kmp-agentic-ci-temp
    - Since the agent needs write access, you **MUST** protect your `main` branch.
    - Go to Repo Settings -> Branches -> Add Rule -> `main` -> Check "Require a pull request before merging".
 2. Create an `ARCHITECTURE.md` in your project root describing patterns/conventions.
-3. Create a `tasks.txt` with your tasks.
+   <details>
+   <summary>Click to see ARCHITECTURE.md example</summary>
+
+   ```markdown
+   # Project Architecture
+
+   ## Patterns
+   - We use MVI (Model-View-Intent) architecture
+   - State is immutable
+   - ViewModels are called "Stores"
+
+   ## Naming Conventions
+   - Screen composables: `[Name]Screen.kt`
+   - State classes: `[Name]State`
+   - Intent sealed interfaces: `[Name]Intent`
+
+   ## Testing
+   - Unit tests go in `src/test/`
+   - UI tests go in `src/androidTest/`
+   ```
+   </details>
+
+3. Create a `tasks.txt` with your tasks (and maybe add it to `.gitignore`!).
 4. Copy your `.env` file into the project root (so the agent can read credentials).
 5. Run the agent:
 
 ```bash
-# Start fresh
 python agent_gemini.py --project-dir /path/to/project
-
-# Continue on the current branch (useful specifically when adding more tasks to an existing PR)
-python agent_gemini.py --project-dir /path/to/project --continue-on-branch
 ```
 
 ---
@@ -273,11 +297,29 @@ Instead of switching per-repo, you can register a runner at the **organization l
 
 ---
 
-## 📚 Documentation
+## 🔧 Troubleshooting
+
+| Issue | Solution |
+|-------|----------|
+| `GH_BOT_TOKEN not set` | Add token to `.env` file |
+| `No tasks.txt found` | Create `tasks.txt` in project root |
+| Agent modifies wrong files | Add files to `PROTECTED_FILES` in `agent_gemini.py` |
+| Build always fails | Check that build command works manually |
+| CI status not detected | Verify `gh` CLI is authenticated |
+
+---
+
+## 🌟 Best Practices
+
+1. **Small, focused tasks** — "Add a logout button" works better than "Refactor the entire auth flow"
+2. **Context is King** — A detailed `ARCHITECTURE.md` helps the agent mimic your coding style
+3. **Review PRs** — The agent is autonomous but not infallible; always review code before merging
+4. **Branch Protection** — Use CI guardrails to prevent broken code from hitting main
+
+---
 
 | Document | Description |
 |----------|-------------|
-| [Usage Guide](./docs/USAGE.md) | Detailed usage instructions |
 | [KMP Template](https://github.com/chrishonson/kmp-agentic-ci-template) | Example mobile project |
 
 ---
@@ -293,4 +335,4 @@ This project explores **agentic CI/CD**—the idea that an AI agent can:
 
 ---
 
-*Built with [Gemini AI](https://ai.google.dev/).*
+*Built with [Gemini AI](https://ai.google.dev/) and [Claude AI](https://claude.ai/).*

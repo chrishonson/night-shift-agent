@@ -30,7 +30,7 @@ load_dotenv()
 
 # Defaults
 DEFAULT_PROVIDER = "gemini"
-DEFAULT_MODEL_GEMINI = "gemini-2.5-flash"
+DEFAULT_MODEL_GEMINI = "gemini-3-flash-preview"
 DEFAULT_MODEL_CLAUDE = "claude-3-5-sonnet-20241022" 
 
 MAX_ITERATIONS = 50
@@ -153,9 +153,10 @@ class LLMClient:
             try:
                 # Use JSON output for structure reliability
                 # --sandbox false disables CLI's internal tools so it acts as pure text generator
+                # Pass prompt as positional argument (stdin/--prompt is deprecated)
                 result = subprocess.run(
-                    ["gemini", "--model", self.model, "--sandbox", "false", "--output-format", "json"],
-                    input=prompt, capture_output=True, text=True, timeout=300
+                    ["gemini", "--model", self.model, "--sandbox", "false", "--output-format", "json", prompt],
+                    capture_output=True, text=True, timeout=300
                 )
                 
                 # Log the raw CLI response
