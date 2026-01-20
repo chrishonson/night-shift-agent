@@ -3,7 +3,30 @@
     "allow": [
       "Bash(gemini:*)",
       "Bash(python agent_gemini.py:*)",
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Bash(cd /Users/nick/AndroidStudioProjects:*)",
+      "Bash(cat:*)",
+      "Bash(pwd:*)",
+      "Bash(mkdir:*)",
+      "Bash(rm:*)",
+      "Bash(mv:*)",
+      "Bash(cp:*)",
+      "Bash(touch:*)",
+      "Bash(echo:*)",
+      "Bash(cat:*)",
+      "Bash(pwd:*)",
+      "Bash(mkdir:*)",
+      "Bash(rm:*)",
+      "Bash(mv:*)",
+      "Bash(cp:*)",
+      "Bash(touch:*)",
+      "Bash(echo:*)",
+      "Bash(tail:*)",
+      "Bash(git:*)",
+      "Bash(gradlew:*)",
+      "Bash(gh:*)",
+      "Bash(head -1 echo '=== Agent Output ===' tail -20 /private/tmp/claude/-Users-nick-AndroidStudioProjects-night-shift-agent/tasks/*.output)",
+      "Bash(pkill:*)"
     ]
   }
 }

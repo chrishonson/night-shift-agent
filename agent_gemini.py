@@ -31,6 +31,7 @@ load_dotenv()
 # Defaults
 DEFAULT_PROVIDER = "gemini"
 DEFAULT_MODEL_GEMINI = "gemini-3-flash-preview"
+DEFAULT_MODEL_OPENROUTER = "mistralai/devstral-2-2512:free"  # Free coding-focused model
 DEFAULT_MODEL_CLAUDE = "claude-3-5-sonnet-20241022" 
 
 MAX_ITERATIONS = 50
@@ -39,12 +40,13 @@ MAX_CI_FIX_ATTEMPTS = 5
 RETRY_BASE_DELAY = 5
 MAX_FILES_IN_CONTEXT = 50
 MAX_CONTEXT_CHARS = 30000
+MAX_TOOL_OUTPUT_CHARS = 50000  # 50KB max per tool output to prevent context explosion
 REQUIRE_BUILD_VERIFICATION = True
 BRANCH_PREFIX = "nightshift"
 
 PROTECTED_FILES = {
     "build.gradle.kts", "settings.gradle.kts", "gradle.properties", 
-    "libs.versions.toml", "gradle-wrapper.properties"
+    "libs.versions.toml", "gradle-wrapper.properties", "tasks.txt"
 }
 
 # Logger Setup - Console only at module level, file handlers added in NightShiftAgent.__init__
@@ -166,9 +168,11 @@ class GeminiCLIProvider(LLMProvider):
         
         for attempt in range(MAX_RETRIES):
             try:
-                # --sandbox false disables internal tools, --output-format json enforces structure
+                # Use stdin for prompt to avoid "Argument list too long" errors
+                # The gemini CLI accepts prompt via stdin when no positional arg given
                 result = subprocess.run(
-                    ["gemini", "--model", self.model, "--sandbox", "false", "--output-format", "json", prompt],
+                    ["gemini", "--model", self.model, "--sandbox", "false", "--output-format", "json"],
+                    input=prompt,
                     capture_output=True, text=True, timeout=300
                 )
                 
@@ -284,15 +288,19 @@ class ClaudeCLIProvider(LLMProvider):
             time.sleep(RETRY_BASE_DELAY * (2 ** attempt))
 
 class OpenRouterAPIProvider(LLMProvider):
-    def __init__(self, model="google/gemini-2.0-flash-exp:free"):
-        self.model = model
-        self.api_key = os.getenv("OPENROUTER_API_KEY")
+    def __init__(self):
+        pass  # Model and key read fresh on each request to allow runtime changes
         
     @property
-    def name(self): return f"OpenRouter API ({self.model})"
+    def name(self): 
+        model = os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL_OPENROUTER)
+        return f"OpenRouter API ({model})"
 
     def ask(self, prompt: str) -> Optional[str]:
-        if not self.api_key:
+        api_key = os.getenv("OPENROUTER_API_KEY")
+        model = os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL_OPENROUTER)
+        
+        if not api_key:
             logger.info(f"⏭️ Skipping {self.name}: OPENROUTER_API_KEY not set")
             raise QuotaExceededError("OpenRouter Key Missing") # Treat as unavailable
 
@@ -306,12 +314,12 @@ class OpenRouterAPIProvider(LLMProvider):
         import json
         
         headers = {
-            "Authorization": f"Bearer {self.api_key}",
+            "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
             "HTTP-Referer": "https://github.com/chrishonson/night-shift-agent",
         }
         data = {
-            "model": self.model,
+            "model": model,
             "messages": [{"role": "user", "content": prompt}]
         }
         
@@ -367,6 +375,7 @@ class ProviderManager:
     """Manages a list of providers and handles failover."""
     def __init__(self):
         self.providers: List[LLMProvider] = []
+        self.current_index = 0  # Persist which provider is working
         self._init_providers()
         
     def _init_providers(self):
@@ -388,21 +397,32 @@ class ProviderManager:
         logger.info(f"🔌 Provider Chain: {[p.name for p in self.providers]}")
 
     def ask(self, prompt: str) -> Optional[str]:
-        for i, provider in enumerate(self.providers):
+        # Start from the last working provider, not always from 0
+        start_index = self.current_index
+        
+        for offset in range(len(self.providers)):
+            i = (start_index + offset) % len(self.providers)
+            provider = self.providers[i]
+            
             try:
-                return provider.ask(prompt)
+                result = provider.ask(prompt)
+                # Success! Remember this provider for next time
+                self.current_index = i
+                return result
             except QuotaExceededError:
                 logger.warning(f"🛑 {provider.name} Quota/Key Limit. Switching...")
-                if i < len(self.providers) - 1:
-                    logger.info(f"🔄 Switching to next provider: {self.providers[i+1].name}...")
+                next_i = (i + 1) % len(self.providers)
+                if next_i != start_index:  # Haven't looped back yet
+                    logger.info(f"🔄 Switching to: {self.providers[next_i].name}...")
                     continue
                 else:
                     logger.error("❌ All providers exhausted!")
                     return None
             except Exception as e:
                 logger.error(f"❌ Critical error in {provider.name}: {e}")
-                # Optional: Failover on crash too? For now, yes.
-                if i < len(self.providers) - 1: continue
+                # Failover on crash too
+                next_i = (i + 1) % len(self.providers)
+                if next_i != start_index: continue
                 return None
         return None
 
@@ -456,18 +476,26 @@ class Toolbox:
     def run_shell(self, command: str) -> str:
         allowed, reason = self.rate_limiter.should_allow(command)
         if not allowed: return f"Error: {reason}"
+        
+        # Auto-add exclusions for grep commands to avoid matching build artifacts
+        cmd_stripped = command.strip()
+        if cmd_stripped.startswith("grep ") and "--exclude-dir" not in command:
+            # Add common exclusions for build directories
+            exclusions = "--exclude-dir=.git --exclude-dir=.gradle --exclude-dir=build --exclude-dir=node_modules --exclude-dir=.idea"
+            # Insert exclusions after 'grep'
+            command = command.replace("grep ", f"grep {exclusions} ", 1)
+            logger.info(f"🔧 Auto-excluded build dirs: {command}")
 
         logger.info(f"🤖 Executing: {command}")
         
         env = os.environ.copy()
-        if os.getenv("GH_BOT_TOKEN") and command.strip().startswith("gh "):
+        if os.getenv("GH_BOT_TOKEN") and cmd_stripped.startswith("gh "):
             env["GITHUB_TOKEN"] = os.getenv("GH_BOT_TOKEN")
 
         try:
             result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=600, env=env)
             
             # Build detection - check command start to avoid false positives (e.g., ".gradle" in grep)
-            cmd_stripped = command.strip()
             is_gradle_build = any(cmd_stripped.startswith(x) for x in ["./gradlew", "gradlew ", "gradle "])
             if is_gradle_build:
                 self.build_state.build_attempted = True
@@ -479,9 +507,16 @@ class Toolbox:
                 else:
                     logger.warning(f"⚠️ Build Failed (Exit {result.returncode})")
 
+            output = result.stdout + result.stderr
+            
+            # Truncate large outputs to prevent context overflow
+            if len(output) > MAX_TOOL_OUTPUT_CHARS:
+                truncated_msg = f"\n\n[OUTPUT TRUNCATED - showing last {MAX_TOOL_OUTPUT_CHARS} chars of {len(output)} total]"
+                output = output[-MAX_TOOL_OUTPUT_CHARS:] + truncated_msg
+            
             if result.returncode != 0:
-                return f"Command failed (exit {result.returncode}):\n{result.stdout + result.stderr}"
-            return result.stdout + result.stderr
+                return f"Command failed (exit {result.returncode}):\n{output}"
+            return output
         except Exception as e: return f"Error: {e}"
 
     def replace(self, path: str = None, old_string: str = None, new_string: str = None, **kwargs) -> str:
@@ -622,14 +657,17 @@ class NightShiftAgent:
         self.build_state.reset()
         system_prompt = f"""You are Night Shift Agent, an autonomous coding assistant.
 
+IMPORTANT: This is a TEXT-ONLY interface. Do NOT use native function calling or built-in tools.
+You must output ALL tool calls as plain text JSON wrapped in <agent_action></agent_action> tags.
+The external system will parse your text output and execute the tools for you.
+
 PROJECT ARCHITECTURE:
 {arch}
 
 PROJECT FILES:
 {files}
 
-AVAILABLE TOOLS:
-You must output tool calls as JSON wrapped in <agent_action></agent_action> tags.
+AVAILABLE TOOLS (output as text, do not use native function calling):
 
 1. read_file - Read the contents of a file
    Args: {{"action": "read_file", "args": {{"path": "path/to/file.kt"}}}}
@@ -659,6 +697,7 @@ WORKFLOW:
 5. Continue until the build passes
 
 RULES:
+- NEVER use native function calling - output tool calls as plain text only
 - Output ONE tool call at a time wrapped in <agent_action> tags
 - Wait for tool output before making the next call
 - Always verify your changes compile before considering the task complete
@@ -747,9 +786,16 @@ RULES:
             if tool_run and self.build_state.build_attempted and not self.build_state.build_passed:
                 consecutive_failures += 1
                 if consecutive_failures >= 5:
-                    logger.warning("⚠️ 5 Consecutive failures. Reverting...")
-                    for p, c in self.build_state.last_successful_files.items():
-                        self.toolbox.write_file(path=p, content=c)
+                    # Only revert if we actually have a checkpoint to revert to
+                    if self.build_state.last_successful_files:
+                        logger.warning(f"⚠️ 5 Consecutive failures. Reverting {len(self.build_state.last_successful_files)} files to checkpoint...")
+                        for p, c in self.build_state.last_successful_files.items():
+                            self.toolbox.write_file(path=p, content=c)
+                            logger.info(f"   ↩️ Reverted: {os.path.basename(p)}")
+                        prompt_history.append("\n\nSYSTEM: Build failed 5 times. Files reverted to last working checkpoint. Try a simpler approach.")
+                    else:
+                        logger.warning("⚠️ 5 Consecutive failures but no checkpoint exists. Notifying model to try simpler approach.")
+                        prompt_history.append("\n\nSYSTEM: Build has failed 5 consecutive times with no working checkpoint to revert to. Please try a simpler, more incremental approach.")
                     consecutive_failures = 0
             
             # Check Success (Build Passed + User Task satisfied implies we should commit)
@@ -801,8 +847,17 @@ RULES:
             clean_task = task.replace("[ ]", "").replace("[!]", "").strip()
             if self.process_task(clean_task, arch_output, files):
                 # Mark done
-                content = open(tasks_file).read().replace(task, f"[x] {clean_task}")
-                open(tasks_file, "w").write(content)
+                # Mark done
+                try:
+                    if os.path.exists(tasks_file):
+                        content = open(tasks_file).read().replace(task, f"[x] {clean_task}")
+                        open(tasks_file, "w").write(content)
+                    else:
+                        logger.warning(f"⚠️ tasks.txt not found. Creating new one with completed task.")
+                        with open(tasks_file, "w") as f:
+                            f.write(f"[x] {clean_task}\n")
+                except Exception as e:
+                    logger.error(f"❌ Failed to update tasks.txt: {e}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
