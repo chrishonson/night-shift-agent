@@ -18,12 +18,18 @@ An autonomous AI coding assistant that processes tasks, writes code, verifies bu
 | `BuildState` | Tracks build status, checkpoints, enables auto-revert |
 | `RateLimiter` | Prevents command spam (3 identical commands in 30s window) |
 
-### Tools (5 available)
+### Tools (6 available)
 - `read_file` - Read file contents
 - `write_file` - Write/create files (respects protected files)
 - `replace` - Find/replace text in files
 - `list_files` - List project files (excludes build dirs, .git, etc.)
-- `run_shell` - Execute shell commands
+- `run_shell` - Execute shell commands (Exploration ONLY)
+- `verify_build` - *NEW* Official build verification (required for task completion)
+
+## Scripts
+- `scripts/start_agent.sh` - Robust startup script (handles nohup/logging)
+- `scripts/stop_agent.sh` - Finds and kills agent processes
+- `scripts/check_models.py` - Utility to list Gemini models
 
 ## Development
 
@@ -53,6 +59,8 @@ python agent_night_shift.py --project-dir /path/to/target
 - **LLM Failover** - Auto-switches Gemini ↔ Claude on quota errors
 - **Tool dispatch** - Normalizes arg names from various LLM output formats
 - **Checkpoint/auto-revert** - Reverts to last good state after 5 consecutive build failures
+- **PR Monitoring & Auto-Fix** - Polls created PRs, fetches CI logs on failure, and auto-patches code
+- **Subprocess Safety** - All background calls use `stdin=subprocess.DEVNULL` to prevent freezing
 - **Rate limiting** - Blocks repeated identical commands
 - **Prompt logging** - Separate `prompts_*.log` for full LLM conversations
 

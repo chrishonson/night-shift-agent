@@ -26,7 +26,12 @@
       "Bash(gradlew:*)",
       "Bash(gh:*)",
       "Bash(head -1 echo '=== Agent Output ===' tail -20 /private/tmp/claude/-Users-nick-AndroidStudioProjects-night-shift-agent/tasks/*.output)",
-      "Bash(pkill:*)"
+      "Bash(pkill:*)",
+      "Bash(git -C /Users/nick/AndroidStudioProjects/kmp-agentic-ci-template show HEAD:tasks.txt)",
+      "Bash(git fetch:*)",
+      "Bash(git checkout:*)",
+      "Bash(git reset:*)",
+      "Bash(git clean:*)"
     ]
   }
 }

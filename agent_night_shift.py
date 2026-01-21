@@ -35,7 +35,7 @@ DEFAULT_MODEL_OPENROUTER = "mistralai/devstral-2-2512:free"  # Free coding-focus
 DEFAULT_MODEL_CLAUDE = "claude-3-5-sonnet-20241022" 
 
 MAX_ITERATIONS = 50
-MAX_RETRIES = 5
+MAX_RETRIES = 2
 MAX_CI_FIX_ATTEMPTS = 5
 RETRY_BASE_DELAY = 5
 MAX_FILES_IN_CONTEXT = 50
@@ -49,16 +49,17 @@ PROTECTED_FILES = {
     "libs.versions.toml", "gradle-wrapper.properties", "tasks.txt"
 }
 
-# Logger Setup - Console only at module level, file handlers added in NightShiftAgent.__init__
+CI_POLL_INTERVAL = 60  # Seconds
+MAX_CI_WAIT_POLLS = 30 # 30 * 60s = 30 minutes
+
+# Logger Setup - Console + file handlers
 SESSION_TIMESTAMP = datetime.now().strftime('%Y%m%d_%H%M%S')
 
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s %(levelname)s %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S',
-    handlers=[logging.StreamHandler(sys.stdout)]  # Console only at module load
-)
 logger = logging.getLogger("NightShiftAgent")
+logger.setLevel(logging.DEBUG)
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s', '%Y-%m-%d %H:%M:%S'))
+logger.addHandler(console_handler)
 
 # Prompt logger - file handler added later in project directory
 prompt_logger = logging.getLogger("PromptLogger")
@@ -168,11 +169,9 @@ class GeminiCLIProvider(LLMProvider):
         
         for attempt in range(MAX_RETRIES):
             try:
-                # Use stdin for prompt to avoid "Argument list too long" errors
-                # The gemini CLI accepts prompt via stdin when no positional arg given
+                # Use positional argument for prompt (stdin/--prompt is deprecated)
                 result = subprocess.run(
-                    ["gemini", "--model", self.model, "--sandbox", "false", "--output-format", "json"],
-                    input=prompt,
+                    ["gemini", "--model", self.model, "--sandbox", "false", "--output-format", "json", prompt],
                     capture_output=True, text=True, timeout=300
                 )
                 
@@ -245,9 +244,11 @@ class ClaudeCLIProvider(LLMProvider):
                     temp_path = f.name
                 
                 try:
+                    # Use --print for non-interactive mode, --tools "" to disable native tools
+                    # This forces text-only output using <agent_action> tags
                     model_arg = f"--model {self.model}" if self.model else ""
-                    cmd = f"cat {temp_path} | claude -p {model_arg} --dangerously-skip-permissions"
-                    result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=300)
+                    cmd = f"cat {temp_path} | claude --print {model_arg} --tools \"\""
+                    result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=300, stdin=subprocess.DEVNULL)
                     
                     self._log_raw_response(attempt, result)
                     self._check_quota(result.stdout + result.stderr)
@@ -445,6 +446,24 @@ class Toolbox:
         self.build_state = build_state
         self.rate_limiter = RateLimiter()
 
+    def exec_command(self, command: str, env: dict = None, timeout: int = 600) -> subprocess.CompletedProcess:
+        """Centralized helper for safe subprocess execution."""
+        if env is None: env = os.environ.copy()
+        try:
+            return subprocess.run(
+                command,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=env,
+                stdin=subprocess.DEVNULL
+            )
+        except Exception as e:
+            # Create a fake failed result if execution blows up (e.g. OOM)
+            logger.error(f"FATAL subprocess error: {e}")
+            raise e
+
     def read_file(self, path: str = None, file_path: str = None) -> str:
         target = path or file_path
         if not target: return "Error: No path"
@@ -493,20 +512,8 @@ class Toolbox:
             env["GITHUB_TOKEN"] = os.getenv("GH_BOT_TOKEN")
 
         try:
-            result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=600, env=env)
+            result = self.exec_command(command, env=env)
             
-            # Build detection - check command start to avoid false positives (e.g., ".gradle" in grep)
-            is_gradle_build = any(cmd_stripped.startswith(x) for x in ["./gradlew", "gradlew ", "gradle "])
-            if is_gradle_build:
-                self.build_state.build_attempted = True
-                self.build_state.build_passed = (result.returncode == 0)
-                if result.returncode == 0:
-                    logger.info("✅ Build Succeeded")
-                    if self.build_state.files_changed_since_success:
-                        self.build_state.checkpoint(self.build_state.files_changed_since_success)
-                else:
-                    logger.warning(f"⚠️ Build Failed (Exit {result.returncode})")
-
             output = result.stdout + result.stderr
             
             # Truncate large outputs to prevent context overflow
@@ -547,11 +554,46 @@ class Toolbox:
                     files.append(os.path.join(root, f))
         return "\n".join(files[:MAX_FILES_IN_CONTEXT])
 
+    def verify_build(self) -> str:
+        """Run the official verification build. This is the ONLY way to pass verification."""
+        VERIFICATION_CMD = "./gradlew assembleDebug :composeApp:linkDebugFrameworkIosSimulatorArm64 detekt"
+        
+        logger.info(f"🔍 Running verification build: {VERIFICATION_CMD}")
+        
+        env = os.environ.copy()
+        try:
+            result = self.exec_command(VERIFICATION_CMD, env=env)
+            
+            self.build_state.build_attempted = True
+            self.build_state.build_passed = (result.returncode == 0)
+            
+            output = result.stdout + result.stderr
+            
+            if result.returncode == 0:
+                # Success - truncate if needed
+                if len(output) > MAX_TOOL_OUTPUT_CHARS:
+                    output = output[-MAX_TOOL_OUTPUT_CHARS:]
+                logger.info("✅ Verification PASSED")
+                if self.build_state.files_changed_since_success:
+                    self.build_state.checkpoint(self.build_state.files_changed_since_success)
+                return f"✅ VERIFICATION PASSED\n\n{output}"
+            else:
+                # Failure - show more error context (beginning + end)
+                if len(output) > MAX_TOOL_OUTPUT_CHARS:
+                    half = MAX_TOOL_OUTPUT_CHARS // 2
+                    output = output[:half] + "\n\n... [TRUNCATED] ...\n\n" + output[-half:]
+                logger.warning(f"❌ Verification FAILED (Exit {result.returncode})")
+                return f"❌ VERIFICATION FAILED (exit {result.returncode}):\n\n{output}"
+        except Exception as e:
+            logger.error(f"❌ Verification error: {e}")
+            return f"Error running verification: {e}"
+
     def dispatch(self, tool_name, args):
         mapping = {
             "read_file": self.read_file, "write_file": self.write_file,
-            "run_shell": self.run_shell, "run_shell_command": self.run_shell, # Alias
-            "replace": self.replace, "list_files": self.list_files
+            "run_shell": self.run_shell, "run_shell_command": self.run_shell,
+            "replace": self.replace, "list_files": self.list_files,
+            "verify_build": self.verify_build, "verify": self.verify_build  # Alias
         }
         
         # Arg Normalization
@@ -632,7 +674,7 @@ class NightShiftAgent:
     def run_cmd_quiet(self, cmd):
         env = os.environ.copy()
         if self.gh_token: env["GITHUB_TOKEN"] = self.gh_token
-        return subprocess.run(cmd, shell=True, capture_output=True, text=True, env=env)
+        return subprocess.run(cmd, shell=True, capture_output=True, text=True, env=env, stdin=subprocess.DEVNULL)
 
     def configure_git(self):
         logger.info("🔧 Configuring git...")
@@ -653,7 +695,149 @@ class NightShiftAgent:
         logger.info(f"🌿 Created branch: {branch}")
         return branch
 
-    def process_task(self, task, arch, files):
+    def commit_changes(self, task: str):
+        logger.info("📝 Committing changes...")
+        self.toolbox.run_shell("git add .")
+        
+        # Escape quotes in task name
+        safe_task = task.replace('"', '\\"')
+        commit_msg = f"Night Shift: {safe_task}"
+        
+        # Check if anything to commit
+        status = self.toolbox.run_shell("git status --porcelain")
+        if not status.strip():
+            logger.warning("⚠️ No changes to commit")
+            return False
+            
+        result = self.toolbox.run_shell(f'git commit -m "{commit_msg}"')
+        if "Command failed" in result:
+             logger.error(f"❌ Failed to commit: {result}")
+             return False
+             
+        logger.info("✅ Changes committed")
+        return True
+
+    def push_and_create_pr(self, task: str, branch: str):
+        logger.info(f"🚀 Pushing branch {branch}...")
+        self.toolbox.run_shell(f"git push -u origin {branch}")
+        
+        # Create PR
+        logger.info("Compare URL: " + self.toolbox.run_shell(f"gh pr create --title \"Night Shift: {task}\" --body \"Automated PR by Night Shift Agent\n\nTask: {task}\" --head {branch} --base main"))
+        # We don't fail if PR usage exists (might be updating existing branch)
+
+    def monitor_pr(self, branch: str):
+        logger.info("\n" + "="*60)
+        logger.info(f"🔍 Monitoring CI Status for branch: {branch}")
+        logger.info("="*60)
+        
+        ci_passed = False
+        
+        for poll in range(MAX_CI_WAIT_POLLS):
+            logger.info(f"⏳ Poll {poll + 1}/{MAX_CI_WAIT_POLLS}: Waiting {CI_POLL_INTERVAL}s for CI...")
+            time.sleep(CI_POLL_INTERVAL)
+            
+            # Check PR status via GH CLI
+            # We look for the statusCheckRollup to see if checks are passing/failing
+            cmd = f"gh pr view {branch} --json statusCheckRollup,state,mergeable --jq '{{state: .state, checks: .statusCheckRollup, mergeable: .mergeable}}'"
+            try:
+                output = self.toolbox.run_shell(cmd)
+                # Parse the JSON output from the command string which might contain extra text if run_shell is verbose
+                # But run_shell returns stdout+stderr. We need to be careful.
+                # Let's assume the JSON is the only thing or we can grep it.
+                # Actually, run_shell captures output.
+                
+                # Clean up if there's logging noise? agent logging goes to stderr/file.
+                
+                # Check for "Command failed"
+                if "Command failed" in output:
+                    logger.warning("⚠️ Failed to check PR status (API error?)")
+                    continue
+
+                # The output might be plain JSON.
+                status_data = json.loads(output.strip())
+                
+                state = status_data.get("state")
+                if state == "MERGED":
+                    logger.info("🎉 PR Merged! Stopping monitor.")
+                    ci_passed = True
+                    break
+                
+                # Check Checks
+                checks = status_data.get("checks", [])
+                if not checks:
+                    logger.info("⏳ No checks reported yet...")
+                    continue
+                
+                # Aggregate status
+                # GitHub returns a complex structure. Simplified check:
+                # We can also check `gh run list --branch {branch}` usually easier for "Any Failure"
+                
+            except Exception as e:
+                logger.warning(f"⚠️ Error parsing PR status: {e}")
+                
+            # Alternative: Check Runs directly which is more reliable for "Did it fail?"
+            run_cmd = f"gh run list --branch {branch} --limit 1 --json status,conclusion,databaseId --jq '.[0]'"
+            run_out = self.toolbox.run_shell(run_cmd)
+            if "Command failed" not in run_out and run_out.strip() != "null":
+                try:
+                    run_data = json.loads(run_out)
+                    status = run_data.get("status")         # queued, in_progress, completed
+                    conclusion = run_data.get("conclusion") # success, failure, cancelled
+                    run_id = run_data.get("databaseId")
+                    
+                    logger.info(f"   Run ID: {run_id} | Status: {status} | Conclusion: {conclusion}")
+                    
+                    if status == "completed":
+                        if conclusion == "success":
+                            logger.info("🎉 CI Checks Passed!")
+                            ci_passed = True
+                            # Auto-merge?
+                            # self.toolbox.run_shell(f"gh pr merge {branch} --auto --squash")
+                            break
+                        elif conclusion in ["failure", "timed_out"]:
+                            logger.error(f"❌ CI Failed (Run {run_id}). Initiating Auto-Fix...")
+                            if self.attempt_fix(branch, run_id):
+                                logger.info("✅ Auto-Fix applied and pushed. Resetting monitor...")
+                                # Reset loop or continue? 
+                                # We should typically break inner loop or reset counter, 
+                                # but for now let's just use the remaining polls.
+                                continue 
+                            else:
+                                logger.error("❌ Auto-Fix failed. Stopping.")
+                                break
+                except: pass
+
+        if ci_passed:
+            logger.info("✅ Monitoring complete: CI Passed.")
+        else:
+            logger.warning("⚠️ Monitoring ended: CI did not pass or timed out.")
+
+    def attempt_fix(self, branch: str, run_id: str) -> bool:
+        logger.info(f"🚑 Attempting Auto-Fix for Run {run_id}...")
+        
+        # 1. Fetch Logs
+        log_cmd = f"gh run view {run_id} --log-failed" 
+        logs = self.toolbox.run_shell(log_cmd)
+        
+        if len(logs) > 5000:
+            logs = logs[-5000:] # Truncate to last 5k chars of error
+            
+        fix_prompt = f"The CI build failed for branch {branch}. Here are the logs:\n\n{logs}\n\nPlease analyze the error and fix the code. Use 'read_file' to examine files if needed, and 'write_file' or 'replace' to fix the issue. Run verification build before finishing."
+        
+        # Reuse process_task logic but with new prompt foundation
+        # We treat "Fix CI Failure" as a task
+        if self.process_task("Fix CI Failure based on logs", logs, self.toolbox.list_files()):
+            # Commit and push the fix
+            if self.commit_changes("Fix CI Failure"):
+                self.toolbox.run_shell(f"git push origin {branch}")
+                logger.info("📤 CI fix pushed to remote.")
+                return True
+            else:
+                logger.warning("⚠️ No changes to commit after fix attempt.")
+                return False
+        return False
+
+    def process_task(self, task, context, files):
         self.build_state.reset()
         system_prompt = f"""You are Night Shift Agent, an autonomous coding assistant.
 
@@ -662,7 +846,7 @@ You must output ALL tool calls as plain text JSON wrapped in <agent_action></age
 The external system will parse your text output and execute the tools for you.
 
 PROJECT ARCHITECTURE:
-{arch}
+{context}
 
 PROJECT FILES:
 {files}
@@ -681,26 +865,33 @@ AVAILABLE TOOLS (output as text, do not use native function calling):
    Args: {{"action": "replace", "args": {{"path": "path/to/file.kt", "old_string": "text to find", "new_string": "replacement text"}}}}
    Returns: Success or error message
 
-4. run_shell - Execute a shell command
-   Args: {{"action": "run_shell", "args": {{"command": "./gradlew assembleDebug"}}}}
+4. run_shell - Execute a shell command (for exploration/debugging ONLY)
+   Args: {{"action": "run_shell", "args": {{"command": "ls -la"}}}}
    Returns: Command output (stdout + stderr)
+   NOTE: This does NOT count as verification. Use verify_build instead.
 
 5. list_files - List all files in a directory
    Args: {{"action": "list_files", "args": {{"path": "."}}}}
    Returns: Newline-separated list of file paths
 
+6. verify_build - Run the official verification build (REQUIRED before task completion)
+   Args: {{"action": "verify_build", "args": {{}}}}
+   Returns: VERIFICATION PASSED or VERIFICATION FAILED with build output
+   NOTE: This is the ONLY way to verify your changes. You MUST call this and it MUST pass.
+
 WORKFLOW:
 1. Read files to understand the current code
 2. Make changes using write_file or replace
-3. Run './gradlew assembleDebug :composeApp:linkDebugFrameworkIosSimulatorArm64 detekt' to verify
-4. If build fails, read the error and fix your code
-5. Continue until the build passes
+3. Call verify_build to run the official verification
+4. If verification fails, read the error and fix your code
+5. Repeat until verify_build returns VERIFICATION PASSED
 
 RULES:
 - NEVER use native function calling - output tool calls as plain text only
 - Output ONE tool call at a time wrapped in <agent_action> tags
 - Wait for tool output before making the next call
-- Always verify your changes compile before considering the task complete
+- You MUST call verify_build before considering the task complete
+- The task is NOT complete until verify_build returns VERIFICATION PASSED
 """
         initial_prompt = system_prompt + f"\nTASK: {task}\n\nBegin by reading the relevant files to understand the current implementation."
         
@@ -774,13 +965,11 @@ RULES:
                     logger.warning(f"Failed to parse action: {e}")
 
             # If no tools were run and files were changed, model might think it's done
-            # Trigger a verification build automatically
+            # Trigger verification automatically
             if not tool_run and self.build_state.files_changed_since_success:
-                logger.info("🔍 No tool calls detected. Running verification build...")
-                build_output = self.toolbox.run_shell(
-                    "./gradlew assembleDebug :composeApp:linkDebugFrameworkIosSimulatorArm64 detekt"
-                )
-                prompt_history.append(f"\n\nAUTO-VERIFICATION BUILD OUTPUT:\n{build_output}")
+                logger.info("🔍 No tool calls detected. Running auto-verification...")
+                build_output = self.toolbox.verify_build()
+                prompt_history.append(f"\n\nAUTO-VERIFICATION OUTPUT:\n{build_output}")
                 
             # Build Failure Logic
             if tool_run and self.build_state.build_attempted and not self.build_state.build_passed:
@@ -799,19 +988,12 @@ RULES:
                     consecutive_failures = 0
             
             # Check Success (Build Passed + User Task satisfied implies we should commit)
-            # Simplified: If build passed this turn, commit.
             if self.build_state.build_passed and self.build_state.is_verified():
-                logger.info("✅ Build Passed. Committing...")
-                # Commit & Push logic here (simplified for refactor brevity)
-                subprocess.run("git add .", shell=True)
-                safe_task = task.replace('"', '\\"')
-                subprocess.run(f'git commit -m "Fix: {safe_task}"', shell=True)
-                current_branch = subprocess.getoutput("git rev-parse --abbrev-ref HEAD")
-                subprocess.run(f"git push -u origin {current_branch}", shell=True)
-                subprocess.run("gh pr create --fill", shell=True)
+                logger.info("✅ Build Passed. Task Complete.")
                 return True
         
         return False
+
 
     def run(self):
         logger.info(f"🚀 Starting Agent in {self.project_dir}")
@@ -841,23 +1023,38 @@ RULES:
         
         files = self.toolbox.list_files()
 
+        completed_tasks = []
         for task in tasks:
             logger.info(f"▶️ Processing: {task}")
             # Clean task string handling
             clean_task = task.replace("[ ]", "").replace("[!]", "").strip()
             if self.process_task(clean_task, arch_output, files):
-                # Mark done
-                # Mark done
+                # Mark task complete in tasks.txt BEFORE commit (so it's included)
                 try:
+                    tasks_file = self.project_dir / "tasks.txt"
                     if os.path.exists(tasks_file):
                         content = open(tasks_file).read().replace(task, f"[x] {clean_task}")
                         open(tasks_file, "w").write(content)
+                        logger.info(f"✅ Marked task complete in tasks.txt: {clean_task}")
                     else:
                         logger.warning(f"⚠️ tasks.txt not found. Creating new one with completed task.")
                         with open(tasks_file, "w") as f:
                             f.write(f"[x] {clean_task}\n")
                 except Exception as e:
                     logger.error(f"❌ Failed to update tasks.txt: {e}")
+
+                # Commit this task's changes (including tasks.txt update)
+                if self.commit_changes(clean_task):
+                    completed_tasks.append(clean_task)
+
+        # Push and create PR only AFTER all tasks are done
+        if completed_tasks:
+            if len(completed_tasks) == 1:
+                pr_title = completed_tasks[0]
+            else:
+                pr_title = f"{len(completed_tasks)} tasks completed"
+            self.push_and_create_pr(pr_title, branch)
+            self.monitor_pr(branch)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
