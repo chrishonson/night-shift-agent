@@ -29,7 +29,7 @@ cp .env.example .env
 # Edit .env with your credentials
 
 # 4. Run against your project
-python agent_gemini.py --project-dir /path/to/your/project
+python agent_night_shift.py --project-dir /path/to/your/project
 ```
 
 ---
@@ -240,7 +240,7 @@ See [kmp-agentic-ci-template](https://github.com/chrishonson/kmp-agentic-ci-temp
 5. Run the agent:
 
 ```bash
-python agent_gemini.py --project-dir /path/to/project
+python agent_night_shift.py --project-dir /path/to/project
 ```
 
 ---
@@ -303,7 +303,7 @@ Instead of switching per-repo, you can register a runner at the **organization l
 |-------|----------|
 | `GH_BOT_TOKEN not set` | Add token to `.env` file |
 | `No tasks.txt found` | Create `tasks.txt` in project root |
-| Agent modifies wrong files | Add files to `PROTECTED_FILES` in `agent_gemini.py` |
+| Agent modifies wrong files | Add files to `PROTECTED_FILES` in `agent_night_shift.py` |
 | Build always fails | Check that build command works manually |
 | CI status not detected | Verify `gh` CLI is authenticated |
 

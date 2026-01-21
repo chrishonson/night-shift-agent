@@ -2,7 +2,7 @@
   "permissions": {
     "allow": [
       "Bash(gemini:*)",
-      "Bash(python agent_gemini.py:*)",
+      "Bash(python agent_night_shift.py:*)",
       "Bash(ls:*)",
       "Bash(cd /Users/nick/AndroidStudioProjects:*)",
       "Bash(cat:*)",

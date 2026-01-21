@@ -3,7 +3,7 @@
 An autonomous AI coding assistant that processes tasks, writes code, verifies builds, and creates PRs.
 
 ## Project Structure
-- `agent_gemini.py` - Main agent script (single-file architecture, ~713 lines)
+- `agent_night_shift.py` - Main agent script (single-file architecture, ~713 lines)
 - `scripts/check_models.py` - Utility to list Gemini models
 - `.env.example` - Template for required environment variables
 
@@ -36,7 +36,7 @@ cp .env.example .env  # Add GH_BOT_TOKEN
 
 ### Running
 ```bash
-python agent_gemini.py --project-dir /path/to/target
+python agent_night_shift.py --project-dir /path/to/target
 ```
 
 ### Environment Variables
@@ -49,7 +49,7 @@ python agent_gemini.py --project-dir /path/to/target
 
 ## Key Patterns
 
-- **Single-file agent** - All logic in `agent_gemini.py`
+- **Single-file agent** - All logic in `agent_night_shift.py`
 - **LLM Failover** - Auto-switches Gemini ↔ Claude on quota errors
 - **Tool dispatch** - Normalizes arg names from various LLM output formats
 - **Checkpoint/auto-revert** - Reverts to last good state after 5 consecutive build failures
@@ -62,7 +62,7 @@ Do not modify these in target projects:
 - `gradle.properties`, `libs.versions.toml`
 - `gradle-wrapper.properties`
 
-## Configuration Constants (agent_gemini.py)
+## Configuration Constants (agent_night_shift.py)
 | Constant | Value | Description |
 |----------|-------|-------------|
 | `MAX_ITERATIONS` | 50 | Max tool calls per task |
