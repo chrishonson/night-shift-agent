@@ -83,3 +83,24 @@ Do not modify these in target projects:
 Session logs saved to `.agent_logs/` in the target project directory:
 - `session_*.log` - Agent operations, tool calls, build results
 - `prompts_*.log` - Complete LLM prompts and responses
+
+## Supervisor Scripts
+
+These scripts are for supervisor agents (Claude Code, etc.) to manage testing. The Night Shift Agent does not use these.
+
+### reset_test.sh
+Resets the target project and runs a fresh agent test.
+
+```bash
+# Default target (kmp-agentic-ci-template)
+./reset_test.sh
+
+# Custom target
+./reset_test.sh /path/to/project
+```
+
+Actions performed:
+1. Kills any running agent processes
+2. Resets target project to `origin/main`
+3. Starts agent in background
+4. Tails the log file (Ctrl+C to stop watching)

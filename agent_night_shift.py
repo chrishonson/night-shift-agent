@@ -717,12 +717,18 @@ class NightShiftAgent:
         logger.info("✅ Changes committed")
         return True
 
-    def push_and_create_pr(self, task: str, branch: str):
+    def push_and_create_pr(self, completed: list, branch: str):
         logger.info(f"🚀 Pushing branch {branch}...")
         self.toolbox.run_shell(f"git push -u origin {branch}")
         
+        # Build nice PR title and body
+        tasks_succeeded = len(completed)
+        pr_title = f"🌙 Night Shift: {tasks_succeeded} task(s)"
+        task_list = "\n".join([f"- [x] {t}" for t in completed])
+        pr_body = f"## 🌙 Night Shift Agent Report\\n\\n**Tasks**: {tasks_succeeded}\\n\\n{task_list}"
+        
         # Create PR
-        logger.info("Compare URL: " + self.toolbox.run_shell(f"gh pr create --title \"Night Shift: {task}\" --body \"Automated PR by Night Shift Agent\n\nTask: {task}\" --head {branch} --base main"))
+        logger.info("Compare URL: " + self.toolbox.run_shell(f'gh pr create --title "{pr_title}" --body "{pr_body}" --head {branch} --base main'))
         # We don't fail if PR usage exists (might be updating existing branch)
 
     def monitor_pr(self, branch: str):
@@ -1049,11 +1055,7 @@ RULES:
 
         # Push and create PR only AFTER all tasks are done
         if completed_tasks:
-            if len(completed_tasks) == 1:
-                pr_title = completed_tasks[0]
-            else:
-                pr_title = f"{len(completed_tasks)} tasks completed"
-            self.push_and_create_pr(pr_title, branch)
+            self.push_and_create_pr(completed_tasks, branch)
             self.monitor_pr(branch)
 
 if __name__ == "__main__":
