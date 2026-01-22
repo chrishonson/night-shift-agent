@@ -15,6 +15,7 @@ import sys
 import re
 import time
 import json
+import urllib.request
 import logging
 import argparse
 import difflib
@@ -30,11 +31,13 @@ load_dotenv()
 
 # Defaults
 DEFAULT_PROVIDER = "gemini"
-DEFAULT_MODEL_GEMINI = "gemini-3-flash-preview"
-DEFAULT_MODEL_OPENROUTER = "mistralai/devstral-2-2512:free"  # Free coding-focused model
+DEFAULT_MODEL_GEMINI = "gemini-1.5-flash"
+DEFAULT_MODEL_OPENROUTER = "google/gemini-2.0-flash-exp:free"
 DEFAULT_MODEL_CLAUDE = "claude-3-5-sonnet-20241022" 
+DEFAULT_MODEL_OLLAMA = "deepseek-r1:32b"
+OLLAMA_BASE_URL = "http://localhost:11434/api/generate" 
 
-MAX_ITERATIONS = 50
+MAX_ITERATIONS = 80
 MAX_RETRIES = 2
 MAX_CI_FIX_ATTEMPTS = 5
 RETRY_BASE_DELAY = 5
@@ -136,8 +139,8 @@ class LLMProvider(ABC):
     """Abstract base class for LLM providers (CLI or API)."""
     
     @abstractmethod
-    def ask(self, prompt: str) -> Optional[str]:
-        """Sends prompt to the model and returns text response."""
+    def ask(self, prompt_or_messages) -> Optional[str]:
+        """Sends prompt (str) or messages (list of dicts) to the model and returns text response."""
         pass
         
     @property
@@ -145,6 +148,20 @@ class LLMProvider(ABC):
     def name(self) -> str:
         """Friendly name for logging."""
         pass
+    
+    def messages_to_string(self, messages: list) -> str:
+        """Converts a list of message dicts to a single string for CLI providers."""
+        parts = []
+        for msg in messages:
+            role = msg.get("role", "user").upper()
+            content = msg.get("content", "")
+            if role == "SYSTEM":
+                parts.append(content)  # System prompt goes first, no prefix
+            elif role == "USER":
+                parts.append(f"\n\nUSER: {content}")
+            elif role == "ASSISTANT":
+                parts.append(f"\n\nASSISTANT: {content}")
+        return "".join(parts).strip()
         
     def strip_markdown_code_blocks(self, text: str) -> str:
         text = text.strip()
@@ -162,9 +179,15 @@ class GeminiCLIProvider(LLMProvider):
     @property
     def name(self): return f"Gemini CLI ({self.model})"
 
-    def ask(self, prompt: str) -> Optional[str]:
+    def ask(self, prompt_or_messages) -> Optional[str]:
+        # Flatten messages list to string for CLI
+        if isinstance(prompt_or_messages, list):
+            prompt = self.messages_to_string(prompt_or_messages)
+        else:
+            prompt = prompt_or_messages
+            
         prompt_logger.debug(
-            f"{'='*80}\n>>> PROMPT TO {self.name}\n{'='*80}\n{prompt}\n{'='*80}\n"
+            f"{'='*80}\n>>> PROMPT TO {self.name}\n{'='*80}\n{prompt[:2000]}\n{'='*80}\n"
         )
         
         for attempt in range(MAX_RETRIES):
@@ -231,9 +254,15 @@ class ClaudeCLIProvider(LLMProvider):
     @property
     def name(self): return f"Claude CLI ({self.model or 'default'})"
 
-    def ask(self, prompt: str) -> Optional[str]:
+    def ask(self, prompt_or_messages) -> Optional[str]:
+        # Flatten messages list to string for CLI
+        if isinstance(prompt_or_messages, list):
+            prompt = self.messages_to_string(prompt_or_messages)
+        else:
+            prompt = prompt_or_messages
+            
         prompt_logger.debug(
-            f"{'='*80}\n>>> PROMPT TO {self.name}\n{'='*80}\n{prompt}\n{'='*80}\n"
+            f"{'='*80}\n>>> PROMPT TO {self.name}\n{'='*80}\n{prompt[:2000]}\n{'='*80}\n"
         )
         
         for attempt in range(MAX_RETRIES):
@@ -288,6 +317,78 @@ class ClaudeCLIProvider(LLMProvider):
         if attempt < MAX_RETRIES - 1:
             time.sleep(RETRY_BASE_DELAY * (2 ** attempt))
 
+class OllamaProvider(LLMProvider):
+    def __init__(self, model=DEFAULT_MODEL_OLLAMA):
+        self.model = model
+        self.base_url = "http://localhost:11434/api/chat"  # Chat API endpoint
+
+    @property
+    def name(self): return f"Ollama ({self.model})"
+
+    def ask(self, prompt_or_messages) -> Optional[str]:
+        # Convert string prompt to messages list if needed
+        if isinstance(prompt_or_messages, str):
+            messages = [{"role": "user", "content": prompt_or_messages}]
+        else:
+            messages = prompt_or_messages
+        
+        prompt_logger.debug(
+            f"{'='*80}\n>>> PROMPT TO {self.name}\n{'='*80}\n{json.dumps(messages, indent=2)[:2000]}\n{'='*80}\n"
+        )
+        
+        for attempt in range(MAX_RETRIES):
+            try:
+                # Prepare JSON payload for Ollama /api/chat
+                data = {
+                    "model": self.model,
+                    "messages": messages,
+                    "stream": False,
+                    "options": {
+                        "temperature": 0.6,   # R1 models need non-zero temp
+                        "num_ctx": 32768      # Large context for DeepSeek-R1
+                    }
+                }
+                
+                req = urllib.request.Request(
+                    self.base_url, 
+                    data=json.dumps(data).encode('utf-8'),
+                    headers={'Content-Type': 'application/json'}
+                )
+                
+                with urllib.request.urlopen(req, timeout=900) as response:
+                    resp_body = response.read().decode('utf-8')
+                    result = json.loads(resp_body)
+                    
+                    self._log_raw_response(attempt, resp_body)
+                    
+                    # Chat API returns message.content
+                    raw_text = result.get("message", {}).get("content", "")
+                    
+                    # Strip <think>...</think> blocks from reasoning models
+                    raw_text = re.sub(r'<think>.*?</think>', '', raw_text, flags=re.DOTALL)
+                    
+                    parsed = self.strip_markdown_code_blocks(raw_text.strip())
+                    
+                    prompt_logger.debug(f"{'='*80}\n<<< PARSED RESPONSE\n{'='*80}\n{parsed}\n{'='*80}\n")
+                    return parsed
+
+            except Exception as e:
+                logger.warning(f"⚠️ {self.name} Exception ({attempt+1}/{MAX_RETRIES}): {e}")
+                self._backoff(attempt)
+        
+        return None
+
+    def _log_raw_response(self, attempt, body):
+         prompt_logger.debug(
+            f"{'='*80}\n<<< RAW RESPONSE ({attempt+1})\n{'='*80}\n"
+            f"{body[:1000]}... (truncated)\n{'='*80}\n"
+        )
+
+    def _backoff(self, attempt):
+        if attempt < MAX_RETRIES - 1:
+            time.sleep(RETRY_BASE_DELAY * (2 ** attempt))
+
+
 class OpenRouterAPIProvider(LLMProvider):
     def __init__(self):
         pass  # Model and key read fresh on each request to allow runtime changes
@@ -297,7 +398,7 @@ class OpenRouterAPIProvider(LLMProvider):
         model = os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL_OPENROUTER)
         return f"OpenRouter API ({model})"
 
-    def ask(self, prompt: str) -> Optional[str]:
+    def ask(self, prompt_or_messages) -> Optional[str]:
         api_key = os.getenv("OPENROUTER_API_KEY")
         model = os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL_OPENROUTER)
         
@@ -305,14 +406,21 @@ class OpenRouterAPIProvider(LLMProvider):
             logger.info(f"⏭️ Skipping {self.name}: OPENROUTER_API_KEY not set")
             raise QuotaExceededError("OpenRouter Key Missing") # Treat as unavailable
 
+        import urllib.request
+        import json
+
+        # Convert string to messages list if needed
+        if isinstance(prompt_or_messages, list):
+            messages = prompt_or_messages
+        else:
+            messages = [{"role": "user", "content": prompt_or_messages}]
+
         prompt_logger.debug(
-            f"{'='*80}\n>>> PROMPT TO {self.name}\n{'='*80}\n{prompt}\n{'='*80}\n"
+            f"{'='*80}\n>>> PROMPT TO {self.name}\n{'='*80}\n{json.dumps(messages, indent=2)[:2000]}\n{'='*80}\n"
         )
         
         # We need generic requests, but trying to avoid external deps if possible.
         # But for OpenRouter, curl/requests is needed. Let's use standard lib urllib to avoid forcing 'requests' install.
-        import urllib.request
-        import json
         
         headers = {
             "Authorization": f"Bearer {api_key}",
@@ -321,7 +429,7 @@ class OpenRouterAPIProvider(LLMProvider):
         }
         data = {
             "model": model,
-            "messages": [{"role": "user", "content": prompt}]
+            "messages": messages
         }
         
         for attempt in range(MAX_RETRIES):
@@ -381,19 +489,17 @@ class ProviderManager:
         
     def _init_providers(self):
         # Determine order based on env preference
-        preferred = os.getenv("PREFERRED_AGENT_PROVIDER", "gemini")
         gemini_model = os.getenv("PREFERRED_AGENT_MODEL", DEFAULT_MODEL_GEMINI)
+        ollama_model = os.getenv("OLLAMA_MODEL", DEFAULT_MODEL_OLLAMA)
         
-        p1 = GeminiCLIProvider(gemini_model)
-        p2 = ClaudeCLIProvider() # Default claude model
-        p3 = OpenRouterAPIProvider() # Fallback to openrouter
+        # Define all providers
+        ollama_p = OllamaProvider(model=ollama_model) # Primary: Local & Free
+        gemini_p = GeminiCLIProvider(model=gemini_model)
+        claude_p = ClaudeCLIProvider() # Default claude model
+        openrouter_p = OpenRouterAPIProvider() # Fallback to openrouter
         
-        if preferred == "claude":
-            self.providers = [p2, p1, p3]
-        elif preferred == "openrouter":
-            self.providers = [p3, p1, p2]
-        else:
-            self.providers = [p1, p2, p3]
+        # User preferred order: Gemini -> Claude -> OpenRouter -> Ollama
+        self.providers = [gemini_p, claude_p, openrouter_p, ollama_p]
             
         logger.info(f"🔌 Provider Chain: {[p.name for p in self.providers]}")
 
@@ -554,9 +660,34 @@ class Toolbox:
                     files.append(os.path.join(root, f))
         return "\n".join(files[:MAX_FILES_IN_CONTEXT])
 
+    def run_tests(self) -> str:
+        """Run tests only (for TDD red/green phases). Does NOT count as final verification."""
+        TEST_CMD = "./gradlew testDebugUnitTest"
+        
+        logger.info(f"🧪 Running tests: {TEST_CMD}")
+        
+        env = os.environ.copy()
+        try:
+            result = self.exec_command(TEST_CMD, env=env, timeout=300)
+            output = result.stdout + result.stderr
+            
+            if len(output) > MAX_TOOL_OUTPUT_CHARS:
+                half = MAX_TOOL_OUTPUT_CHARS // 2
+                output = output[:half] + "\n\n... [TRUNCATED] ...\n\n" + output[-half:]
+            
+            if result.returncode == 0:
+                logger.info("✅ Tests PASSED")
+                return f"✅ TESTS PASSED\n\n{output}"
+            else:
+                logger.info("🔴 Tests FAILED (expected in TDD red phase)")
+                return f"🔴 TESTS FAILED (exit {result.returncode}):\n\n{output}"
+        except Exception as e:
+            logger.error(f"❌ Test error: {e}")
+            return f"Error running tests: {e}"
+
     def verify_build(self) -> str:
-        """Run the official verification build. This is the ONLY way to pass verification."""
-        VERIFICATION_CMD = "./gradlew assembleDebug :composeApp:linkDebugFrameworkIosSimulatorArm64 detekt"
+        """Run the official verification build with coverage. This is the ONLY way to pass verification."""
+        VERIFICATION_CMD = "./gradlew assembleDebug :composeApp:linkDebugFrameworkIosSimulatorArm64 detekt testDebugUnitTest koverVerify"
         
         logger.info(f"🔍 Running verification build: {VERIFICATION_CMD}")
         
@@ -576,7 +707,7 @@ class Toolbox:
                 logger.info("✅ Verification PASSED")
                 if self.build_state.files_changed_since_success:
                     self.build_state.checkpoint(self.build_state.files_changed_since_success)
-                return f"✅ VERIFICATION PASSED\n\n{output}"
+                return f"✅ VERIFICATION PASSED (build + tests + coverage)\n\n{output}"
             else:
                 # Failure - show more error context (beginning + end)
                 if len(output) > MAX_TOOL_OUTPUT_CHARS:
@@ -593,6 +724,7 @@ class Toolbox:
             "read_file": self.read_file, "write_file": self.write_file,
             "run_shell": self.run_shell, "run_shell_command": self.run_shell,
             "replace": self.replace, "list_files": self.list_files,
+            "run_tests": self.run_tests, "test": self.run_tests,  # TDD tool
             "verify_build": self.verify_build, "verify": self.verify_build  # Alias
         }
         
@@ -687,6 +819,12 @@ class NightShiftAgent:
             logger.info(f"✅ Authenticated for {repo}")
 
     def create_branch(self):
+        # Check current branch
+        current = self.run_cmd_quiet("git branch --show-current").stdout.strip()
+        if current.startswith(BRANCH_PREFIX + "/"):
+            logger.info(f"🌿 Reusing existing branch: {current}")
+            return current
+
         ts = datetime.now().strftime('%Y%m%d-%H%M%S')
         branch = f"{BRANCH_PREFIX}/{ts}"
         self.run_cmd_quiet("git checkout main")
@@ -845,11 +983,11 @@ class NightShiftAgent:
 
     def process_task(self, task, context, files):
         self.build_state.reset()
-        system_prompt = f"""You are Night Shift Agent, an autonomous coding assistant.
+        system_prompt = f"""You are Night Shift Agent, an autonomous coding assistant that follows Test-Driven Development (TDD).
 
 IMPORTANT: This is a TEXT-ONLY interface. Do NOT use native function calling or built-in tools.
 You must output ALL tool calls as plain text JSON wrapped in <agent_action></agent_action> tags.
-The external system will parse your text output and execute the tools for you.
+The external system will parse your text output and execute the tools for you. Utilize your <think> block to plan the TDD (if applicable).
 
 PROJECT ARCHITECTURE:
 {context}
@@ -874,55 +1012,112 @@ AVAILABLE TOOLS (output as text, do not use native function calling):
 4. run_shell - Execute a shell command (for exploration/debugging ONLY)
    Args: {{"action": "run_shell", "args": {{"command": "ls -la"}}}}
    Returns: Command output (stdout + stderr)
-   NOTE: This does NOT count as verification. Use verify_build instead.
+   NOTE: This does NOT count as verification.
 
 5. list_files - List all files in a directory
    Args: {{"action": "list_files", "args": {{"path": "."}}}}
    Returns: Newline-separated list of file paths
 
-6. verify_build - Run the official verification build (REQUIRED before task completion)
+6. run_tests - Run unit tests only (for TDD red/green phases)
+   Args: {{"action": "run_tests", "args": {{}}}}
+   Returns: TESTS PASSED or TESTS FAILED with test output
+   NOTE: Use this during TDD cycles. Does NOT count as final verification.
+
+7. verify_build - Run full verification (build + tests + coverage) - REQUIRED before task completion
    Args: {{"action": "verify_build", "args": {{}}}}
    Returns: VERIFICATION PASSED or VERIFICATION FAILED with build output
-   NOTE: This is the ONLY way to verify your changes. You MUST call this and it MUST pass.
+   NOTE: This runs assembleDebug, iOS framework build, detekt, tests, AND koverVerify.
+         The task is NOT complete until this passes.
 
-WORKFLOW:
-1. Read files to understand the current code
-2. Make changes using write_file or replace
-3. Call verify_build to run the official verification
-4. If verification fails, read the error and fix your code
-5. Repeat until verify_build returns VERIFICATION PASSED
+=== TDD WORKFLOW (MANDATORY) ===
+
+You MUST follow Test-Driven Development for every task:
+
+🔴 RED PHASE:
+1. Read existing code and tests to understand the codebase
+2. Write a failing test FIRST that defines the expected behavior
+3. Call run_tests to confirm the test FAILS (this is expected and correct!)
+   - If tests pass, your test isn't testing new behavior - make it more specific
+
+🟢 GREEN PHASE:
+4. Write the minimum implementation code to make the test pass
+5. Call run_tests to confirm tests now PASS
+   - If tests fail, fix your implementation (not the test!)
+
+🔵 REFACTOR PHASE:
+6. Clean up the code while keeping tests passing
+7. Call run_tests after any refactoring to ensure nothing broke
+
+✅ FINAL VERIFICATION:
+8. Call verify_build to run the full verification suite (build + tests + coverage)
+9. The task is complete ONLY when verify_build returns VERIFICATION PASSED
 
 RULES:
+- NEVER skip the RED phase - always write tests BEFORE implementation
 - NEVER use native function calling - output tool calls as plain text only
 - Output ONE tool call at a time wrapped in <agent_action> tags
 - Wait for tool output before making the next call
+- Tests go in: composeApp/src/commonTest/kotlin/... (mirror the main source structure)
 - You MUST call verify_build before considering the task complete
-- The task is NOT complete until verify_build returns VERIFICATION PASSED
+- Coverage thresholds are enforced by koverVerify - ensure adequate test coverage
 """
-        initial_prompt = system_prompt + f"\nTASK: {task}\n\nBegin by reading the relevant files to understand the current implementation."
+        task_intro = f"TASK: {task}\n\nBegin by reading the relevant files to understand the current implementation."
         
-        prompt_history = []
+        # Initialize messages list with system prompt and task
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": task_intro}
+        ]
         consecutive_failures = 0
 
-        for i in range(MAX_ITERATIONS):
+        last_provider_index = self.llm.current_index
+        i = 0
+        while i < MAX_ITERATIONS:
             logger.info(f"🔄 Iteration {i+1}/{MAX_ITERATIONS}")
             
-            # Context Pruning
-            full_text = initial_prompt + "".join(prompt_history)
-            while len(prompt_history) > 2 and len(full_text) > MAX_CONTEXT_CHARS:
-                prompt_history.pop(0)
-                full_text = initial_prompt + "".join(prompt_history)
+            # Check for silent provider switch (e.g. QuotaExceeded inside ask())
+            # and reset iteration count if it happened to give new model a chance
+            if self.llm.current_index != last_provider_index:
+                logger.info(f"🔄 Provider switched! Resetting iteration count to 1/{MAX_ITERATIONS}")
+                i = 0
+                last_provider_index = self.llm.current_index
+            
+            # Context Pruning: preserve system (0) and task (1), prune middle pairs
+            total_chars = sum(len(m.get("content", "")) for m in messages)
+            while len(messages) > 4 and total_chars > MAX_CONTEXT_CHARS:
+                # Remove oldest user/assistant pair after the task (indices 2, 3)
+                messages.pop(2)
+                messages.pop(2)  # Was index 3, now 2 after first pop
+                total_chars = sum(len(m.get("content", "")) for m in messages)
+                logger.info(f"🧹 Pruned context: {len(messages)} messages, {total_chars} chars")
 
-            # LLM Call
-            response = self.llm.ask(full_text)
+            # LLM Call with messages list
+            response = self.llm.ask(messages)
             if not response: return False
             
-            prompt_history.append(f"\n\nASSISTANT: {response}")
+            messages.append({"role": "assistant", "content": response})
             
             # Extract Actions
             actions = re.findall(r'<agent_action>(.*?)</agent_action>', response, re.DOTALL)
-            if not actions and "{" in response: # Fallback regex
-                 actions = re.findall(r'\{[^{}]*\}', response) # Simplified fallback
+            if not actions and "{" in response:
+                # Fallback: Robustly find JSON objects using decoder to handle nesting
+                try:
+                    decoder = json.JSONDecoder()
+                    pos = 0
+                    while pos < len(response):
+                        match = re.search(r'\{', response[pos:])
+                        if not match: break
+                        start = pos + match.start()
+                        try:
+                            obj, end = decoder.raw_decode(response, start)
+                            # Verify likely action object
+                            if isinstance(obj, dict) and any(k in obj for k in ("action", "tool", "tool_code")):
+                                actions.append(json.dumps(obj))
+                            pos = end
+                        except json.JSONDecodeError:
+                            pos = start + 1
+                except Exception as e:
+                    logger.warning(f"⚠️ JSON Fallback extraction error: {e}")
             
             tool_run = False
             for action_str in actions:
@@ -965,7 +1160,7 @@ RULES:
                     if tool:
                         logger.info(f"🛠️ Tool: {tool}")
                         output = self.toolbox.dispatch(tool, args)
-                        prompt_history.append(f"\n\nTOOL OUTPUT ({tool}): {output}")
+                        messages.append({"role": "user", "content": f"TOOL OUTPUT ({tool}): {output}"})
                         tool_run = True
                 except Exception as e:
                     logger.warning(f"Failed to parse action: {e}")
@@ -975,7 +1170,7 @@ RULES:
             if not tool_run and self.build_state.files_changed_since_success:
                 logger.info("🔍 No tool calls detected. Running auto-verification...")
                 build_output = self.toolbox.verify_build()
-                prompt_history.append(f"\n\nAUTO-VERIFICATION OUTPUT:\n{build_output}")
+                messages.append({"role": "user", "content": f"AUTO-VERIFICATION OUTPUT:\n{build_output}"})
                 
             # Build Failure Logic
             if tool_run and self.build_state.build_attempted and not self.build_state.build_passed:
@@ -987,16 +1182,19 @@ RULES:
                         for p, c in self.build_state.last_successful_files.items():
                             self.toolbox.write_file(path=p, content=c)
                             logger.info(f"   ↩️ Reverted: {os.path.basename(p)}")
-                        prompt_history.append("\n\nSYSTEM: Build failed 5 times. Files reverted to last working checkpoint. Try a simpler approach.")
+                        messages.append({"role": "user", "content": "SYSTEM: Build failed 5 times. Files reverted to last working checkpoint. Try a simpler approach."})
                     else:
                         logger.warning("⚠️ 5 Consecutive failures but no checkpoint exists. Notifying model to try simpler approach.")
-                        prompt_history.append("\n\nSYSTEM: Build has failed 5 consecutive times with no working checkpoint to revert to. Please try a simpler, more incremental approach.")
+                        messages.append({"role": "user", "content": "SYSTEM: Build has failed 5 consecutive times with no working checkpoint to revert to. Please try a simpler, more incremental approach."})
                     consecutive_failures = 0
             
             # Check Success (Build Passed + User Task satisfied implies we should commit)
             if self.build_state.build_passed and self.build_state.is_verified():
                 logger.info("✅ Build Passed. Task Complete.")
                 return True
+            
+            i += 1
+            time.sleep(2)
         
         return False
 
