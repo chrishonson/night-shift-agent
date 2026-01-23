@@ -32,7 +32,8 @@
       "Bash(git checkout:*)",
       "Bash(git reset:*)",
       "Bash(git clean:*)",
-      "Bash(chmod:*)"
+      "Bash(chmod:*)",
+      "Bash(python scripts/check_models.py:*)"
     ]
   }
 }

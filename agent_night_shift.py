@@ -31,7 +31,7 @@ load_dotenv()
 
 # Defaults
 DEFAULT_PROVIDER = "gemini"
-DEFAULT_MODEL_GEMINI = "gemini-1.5-flash"
+DEFAULT_MODEL_GEMINI = "gemini-2.5-flash-lite"
 DEFAULT_MODEL_OPENROUTER = "google/gemini-2.0-flash-exp:free"
 DEFAULT_MODEL_CLAUDE = "claude-3-5-sonnet-20241022" 
 DEFAULT_MODEL_OLLAMA = "deepseek-r1:32b"
@@ -44,6 +44,7 @@ RETRY_BASE_DELAY = 5
 MAX_FILES_IN_CONTEXT = 50
 MAX_CONTEXT_CHARS = 30000
 MAX_TOOL_OUTPUT_CHARS = 50000  # 50KB max per tool output to prevent context explosion
+REPLACE_STALL_THRESHOLD = 3
 REQUIRE_BUILD_VERIFICATION = True
 BRANCH_PREFIX = "nightshift"
 
@@ -660,6 +661,67 @@ class Toolbox:
                     files.append(os.path.join(root, f))
         return "\n".join(files[:MAX_FILES_IN_CONTEXT])
 
+    def _parse_and_contextualize_errors(self, output: str) -> str:
+        """Parses compiler errors, reads source files, and returns a focused error report."""
+        # Regex patterns for common Kotlin/Gradle errors
+        # 1. e: file:///path/to/File.kt:10:20: error: message
+        # 2. e: /path/to/File.kt: (10, 20): message
+        error_patterns = [
+            r"(?P<level>[ew]):\s+(?P<path>file://[^:]+|/[^:]+):\s*\(?(?P<line>\d+)[:,\s]+(?P<col>\d+)\)?:\s*(?P<msg>.*)",
+            r"(?P<path>[^:\n]+\.kt):\s*(?P<line>\d+):\s*(?P<col>\d+):\s*error:\s*(?P<msg>.*)"
+        ]
+        
+        extracted_errors = []
+        files_to_read = set()
+        
+        for line in output.split('\n'):
+            for pattern in error_patterns:
+                match = re.search(pattern, line)
+                if match:
+                    path_str = match.group("path").strip()
+                    # Fix file:// prefix
+                    if path_str.startswith("file://"):
+                        path_str = path_str[7:]
+                    
+                    # Normalize absolute paths
+                    if os.path.exists(path_str):
+                         files_to_read.add(os.path.abspath(path_str))
+                    
+                    extracted_errors.append(line)
+                    break # Single match per line
+                    
+        if not extracted_errors:
+            # Fallback output if no specific errors parsed
+             if len(output) > MAX_TOOL_OUTPUT_CHARS:
+                half = MAX_TOOL_OUTPUT_CHARS // 2
+                return output[:half] + "\n\n... [TRUNCATED] ...\n\n" + output[-half:]
+             return output
+
+        # Read files
+        file_contexts = []
+        for file_path in files_to_read:
+             try:
+                 with open(file_path, 'r') as f:
+                     content = f.read()
+                     file_contexts.append(f"--- FILE: {file_path} ---\n{content}\n")
+             except Exception as e:
+                 file_contexts.append(f"--- FILE: {file_path} ---\n[Error reading file: {e}]\n")
+        
+        # Assemble report
+        report_parts = [
+            "❌ BUILD FAILED - ERROR REPORT",
+            "\n=== EXTRACTED ERRORS ==="
+        ]
+        report_parts.extend(extracted_errors)
+        
+        report_parts.append("\n=== SOURCE FILES CONTEXT ===")
+        report_parts.extend(file_contexts)
+        
+        report_parts.append("\n=== RAW OUTPUT TAIL (Last 2000 chars) ===")
+        report_parts.append(output[-2000:])
+        
+        return "\n".join(report_parts)
+
     def run_tests(self) -> str:
         """Run tests only (for TDD red/green phases). Does NOT count as final verification."""
         TEST_CMD = "./gradlew testDebugUnitTest"
@@ -670,17 +732,17 @@ class Toolbox:
         try:
             result = self.exec_command(TEST_CMD, env=env, timeout=300)
             output = result.stdout + result.stderr
-            
-            if len(output) > MAX_TOOL_OUTPUT_CHARS:
-                half = MAX_TOOL_OUTPUT_CHARS // 2
-                output = output[:half] + "\n\n... [TRUNCATED] ...\n\n" + output[-half:]
+            logger.debug(f"Full Test Output:\n{output}")
             
             if result.returncode == 0:
                 logger.info("✅ Tests PASSED")
+                if len(output) > MAX_TOOL_OUTPUT_CHARS:
+                    half = MAX_TOOL_OUTPUT_CHARS // 2
+                    output = output[:half] + "\n\n... [TRUNCATED] ...\n\n" + output[-half:]
                 return f"✅ TESTS PASSED\n\n{output}"
             else:
                 logger.info("🔴 Tests FAILED (expected in TDD red phase)")
-                return f"🔴 TESTS FAILED (exit {result.returncode}):\n\n{output}"
+                return f"🔴 TESTS FAILED (exit {result.returncode}):\n\n{self._parse_and_contextualize_errors(output)}"
         except Exception as e:
             logger.error(f"❌ Test error: {e}")
             return f"Error running tests: {e}"
@@ -699,6 +761,7 @@ class Toolbox:
             self.build_state.build_passed = (result.returncode == 0)
             
             output = result.stdout + result.stderr
+            logger.debug(f"Full Verification Output:\n{output}")
             
             if result.returncode == 0:
                 # Success - truncate if needed
@@ -709,12 +772,9 @@ class Toolbox:
                     self.build_state.checkpoint(self.build_state.files_changed_since_success)
                 return f"✅ VERIFICATION PASSED (build + tests + coverage)\n\n{output}"
             else:
-                # Failure - show more error context (beginning + end)
-                if len(output) > MAX_TOOL_OUTPUT_CHARS:
-                    half = MAX_TOOL_OUTPUT_CHARS // 2
-                    output = output[:half] + "\n\n... [TRUNCATED] ...\n\n" + output[-half:]
+                # Failure - use smart parsing
                 logger.warning(f"❌ Verification FAILED (Exit {result.returncode})")
-                return f"❌ VERIFICATION FAILED (exit {result.returncode}):\n\n{output}"
+                return f"❌ VERIFICATION FAILED (exit {result.returncode}):\n\n{self._parse_and_contextualize_errors(output)}"
         except Exception as e:
             logger.error(f"❌ Verification error: {e}")
             return f"Error running verification: {e}"
@@ -970,7 +1030,18 @@ class NightShiftAgent:
         
         # Reuse process_task logic but with new prompt foundation
         # We treat "Fix CI Failure" as a task
-        if self.process_task("Fix CI Failure based on logs", logs, self.toolbox.list_files()):
+        arch_output = self.toolbox.run_shell("tree -L 2 -I 'build|.*' 2>/dev/null || find . -maxdepth 2 -type d ! -path '*/.*' ! -path './build*' 2>/dev/null | head -50")
+
+        arch_doc = self.project_dir / "docs" / "ARCHITECTURE.md"
+        if arch_doc.exists():
+            try:
+                arch_content = arch_doc.read_text()
+                arch_output = f"=== Directory Structure ===\n{arch_output}\n\n=== ARCHITECTURE.md ===\n{arch_content}"
+            except Exception as e:
+                logger.warning(f"Failed to read ARCHITECTURE.md: {e}")
+
+        files = self.toolbox.list_files()
+        if self.process_task(fix_prompt, arch_output, files):
             # Commit and push the fix
             if self.commit_changes("Fix CI Failure"):
                 self.toolbox.run_shell(f"git push origin {branch}")
@@ -1069,6 +1140,7 @@ RULES:
             {"role": "user", "content": task_intro}
         ]
         consecutive_failures = 0
+        replace_repeat_counts = {}
 
         last_provider_index = self.llm.current_index
         i = 0
@@ -1161,6 +1233,30 @@ RULES:
                         logger.info(f"🛠️ Tool: {tool}")
                         output = self.toolbox.dispatch(tool, args)
                         messages.append({"role": "user", "content": f"TOOL OUTPUT ({tool}): {output}"})
+
+                        if tool == "replace":
+                            target_path = args.get("path")
+                            key_payload = {
+                                "tool": tool,
+                                "path": target_path,
+                                "old_string": args.get("old_string"),
+                                "new_string": args.get("new_string")
+                            }
+                            key = json.dumps(key_payload, sort_keys=True)
+
+                            output_lower = output.lower()
+                            if "text not found" in output_lower or "already present" in output_lower:
+                                replace_repeat_counts[key] = replace_repeat_counts.get(key, 0) + 1
+                                if target_path and replace_repeat_counts[key] >= REPLACE_STALL_THRESHOLD:
+                                    file_output = self.toolbox.dispatch("read_file", {"path": target_path})
+                                    if len(file_output) > MAX_TOOL_OUTPUT_CHARS:
+                                        file_output = file_output[:MAX_TOOL_OUTPUT_CHARS] + "\n\n[OUTPUT TRUNCATED]"
+                                    messages.append({"role": "user", "content": f"TOOL OUTPUT (read_file): {file_output}"})
+                                    messages.append({"role": "user", "content": f"SYSTEM: Repeated replace failed {replace_repeat_counts[key]} times for {target_path}. Re-read the file and choose a different approach."})
+                                    replace_repeat_counts[key] = 0
+                            else:
+                                replace_repeat_counts.pop(key, None)
+
                         tool_run = True
                 except Exception as e:
                     logger.warning(f"Failed to parse action: {e}")
