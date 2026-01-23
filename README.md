@@ -1,8 +1,8 @@
-# 🌙 Night Shift Agent v3.6
+# Night Shift Agent v3.6
 
 > **An AI-powered autonomous coding assistant that works while you sleep.**
 
-Night Shift Agent is a Python-based autonomous coding agent powered by **Gemini AI** (with **Claude AI** failover). It reads a task list, writes code, verifies builds, creates pull requests, and monitors CI—all without human intervention.
+Night Shift Agent is a Python-based autonomous coding agent powered by **Gemini AI** (with automatic failover to Claude, OpenRouter, and Ollama). It reads a task list, writes code, verifies builds, creates pull requests, and monitors CI—all without human intervention.
 
 ## Why Night Shift?
 
@@ -12,7 +12,7 @@ Mobile apps require platform SDKs (Android SDK, Xcode), emulators, proprietary b
 
 ---
 
-## ⚡ Quick Start
+## Quick Start
 
 ```bash
 # 1. Clone the agent
@@ -34,45 +34,53 @@ python agent_night_shift.py --project-dir /path/to/your/project
 
 ---
 
-## 🤖 How It Works
+## How It Works
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                   🌙 Night Shift Agent v3.6                     │
+│                   Night Shift Agent v3.6                        │
 │                                                                 │
 │   tasks.txt ──▶ LLM (Gemini/Claude) ──▶ Code Changes ──▶ PR     │
 │                        │                                        │
 │              ┌─────────┴─────────┐                              │
-│              │      5 Tools      │                              │
+│              │      7 Tools      │                              │
 │              ├───────────────────┤                              │
 │              │ read_file         │                              │
 │              │ write_file        │                              │
 │              │ replace           │                              │
 │              │ list_files        │                              │
 │              │ run_shell         │                              │
+│              │ run_tests         │                              │
+│              │ verify_build      │                              │
 │              └───────────────────┘                              │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-The agent operates in a loop:
+The agent operates in a TDD loop:
 1. **Read** the next uncompleted task from `tasks.txt`
 2. **Understand** the codebase using `list_files` and `read_file`
-3. **Write** code changes with `write_file` or `replace`
-4. **Verify** the build with your project's build command
-5. **Commit** when verification passes
-6. **Repeat** until all tasks are complete
-7. **Push** and create Pull Request
+3. **Write tests first** using `write_file` (TDD red phase)
+4. **Run tests** with `run_tests` to confirm they fail
+5. **Implement** code to make tests pass (TDD green phase)
+6. **Verify** with `verify_build` (build + tests + coverage)
+7. **Commit** when verification passes
+8. **Repeat** until all tasks are complete
+9. **Push** and create Pull Request
 
 ### LLM Provider Failover
 
 The agent supports **automatic failover** between LLM providers:
-- If **Gemini** hits a rate limit or quota, it automatically switches to **Claude**
-- If **Claude** is also exhausted, the agent stops gracefully
-- You can set your preferred starting provider via environment variables
+
+1. **Gemini CLI** (primary) - uses `gemini` command
+2. **Claude CLI** - uses `claude --print`
+3. **OpenRouter API** - requires `OPENROUTER_API_KEY`
+4. **Ollama** - local inference at `localhost:11434`
+
+When any provider hits a rate limit or quota, it automatically switches to the next.
 
 ---
 
-## 📋 Configuration
+## Configuration
 
 Create a `.env` file (copy from `.env.example`):
 
@@ -81,9 +89,13 @@ Create a `.env` file (copy from `.env.example`):
 GH_BOT_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxx  # GitHub PAT with repo access
 
 # Optional - Agent Configuration
-BOT_USERNAME=agentnightshift             # Git commit author (default: agentnightshift)
-PREFERRED_AGENT_PROVIDER=gemini          # LLM provider: "gemini" or "claude" (default: gemini)
-PREFERRED_AGENT_MODEL=gemini-3-flash-preview  # Model name (default: gemini-3-flash-preview)
+BOT_USERNAME=agentnightshift                    # Git commit author (default: agentnightshift)
+PREFERRED_AGENT_MODEL=gemini-2.5-flash-lite     # Gemini model (default: gemini-2.5-flash-lite)
+
+# Optional - Additional Providers
+OLLAMA_MODEL=deepseek-r1:32b                    # Ollama model (default: deepseek-r1:32b)
+OPENROUTER_API_KEY=sk-or-...                    # OpenRouter API key
+OPENROUTER_MODEL=google/gemini-2.0-flash-exp:free  # OpenRouter model
 ```
 
 ### GitHub Token Permissions
@@ -96,7 +108,7 @@ Your `GH_BOT_TOKEN` needs these permissions:
 
 ---
 
-## 📁 Task File Format
+## Task File Format
 
 Create a `tasks.txt` in your target project:
 
@@ -119,7 +131,7 @@ After processing:
 
 ---
 
-## 🛡️ Protected Files
+## Protected Files
 
 The agent **cannot modify** these critical build files (configurable in script):
 
@@ -128,12 +140,13 @@ The agent **cannot modify** these critical build files (configurable in script):
 - `gradle.properties`
 - `libs.versions.toml`
 - `gradle-wrapper.properties`
+- `tasks.txt`
 
 ---
 
-## 📊 Logs
+## Logs
 
-Session logs are saved to `.agent_logs/` in the project directory:
+Session logs are saved to `.agent_logs/` in the target project directory:
 
 ```
 .agent_logs/
@@ -142,8 +155,6 @@ Session logs are saved to `.agent_logs/` in the project directory:
 └── ...
 ```
 
-### Log Types
-
 | File | Contents |
 |------|----------|
 | `session_*.log` | Agent operations, tool calls, build results |
@@ -151,7 +162,7 @@ Session logs are saved to `.agent_logs/` in the project directory:
 
 ---
 
-## 🛡️ Reliability Features
+## Reliability Features
 
 The agent includes several safeguards to prevent runaway failures:
 
@@ -176,28 +187,18 @@ This prevents the agent from spiraling into an infinite loop of failed attempts.
 
 ### Rate Limiting
 
-To prevent command spam (e.g., retrying the same failing build 40+ times), the agent enforces rate limits:
+To prevent command spam (e.g., retrying the same failing build), the agent enforces rate limits:
 
 - **Same command limit**: Max 3 identical commands within 30 seconds
 - When rate-limited, the agent is told to read error logs and try a different approach
 
-### Enhanced Diff Logging
+### Context Pruning
 
-Every file write now logs a compact diff showing what changed:
-
-```
-✍️ Wrote file: ChatService.kt (1898 bytes)
-   📝 Change: +15 lines, was 1447B -> now 1898B
-   +import some.new.package
-   -old_function()
-   +new_function()
-```
-
-This makes it easy to identify exactly what change broke a build when reviewing logs.
+When conversation context exceeds 30,000 characters, the agent automatically drops the oldest message pairs (preserving system prompt and current task) to stay within limits.
 
 ---
 
-## �🔧 Project Integration
+## Project Integration
 
 ### For Kotlin Multiplatform Projects
 
@@ -209,10 +210,11 @@ See [kmp-agentic-ci-template](https://github.com/chrishonson/kmp-agentic-ci-temp
 
 ### For All Projects
 
-1. Join the **Branch Protection** club!
+1. **Enable Branch Protection**
    - Since the agent needs write access, you **MUST** protect your `main` branch.
-   - Go to Repo Settings -> Branches -> Add Rule -> `main` -> Check "Require a pull request before merging".
-2. Create an `ARCHITECTURE.md` in your project root describing patterns/conventions.
+   - Go to Repo Settings → Branches → Add Rule → `main` → Check "Require a pull request before merging".
+
+2. **Create an `ARCHITECTURE.md`** in your project root describing patterns/conventions.
    <details>
    <summary>Click to see ARCHITECTURE.md example</summary>
 
@@ -235,9 +237,9 @@ See [kmp-agentic-ci-template](https://github.com/chrishonson/kmp-agentic-ci-temp
    ```
    </details>
 
-3. Create a `tasks.txt` with your tasks (and maybe add it to `.gitignore`!).
-4. Copy your `.env` file into the project root (so the agent can read credentials).
-5. Run the agent:
+3. **Create a `tasks.txt`** with your tasks (and maybe add it to `.gitignore`!).
+
+4. **Run the agent**:
 
 ```bash
 python agent_night_shift.py --project-dir /path/to/project
@@ -245,17 +247,17 @@ python agent_night_shift.py --project-dir /path/to/project
 
 ---
 
-## 🏃 Self-Hosted Runner Setup
+## Self-Hosted Runner Setup
 
-If your project includes UI tests that run on a self-hosted runner (like `connectedAndroidTest`), you'll need to configure your local machine as a GitHub Actions runner for each new repository.
+If your project includes UI tests that run on a self-hosted runner (like `connectedAndroidTest`), you'll need to configure your local machine as a GitHub Actions runner.
 
 ### First-Time Setup
 
-If you've never set up a runner, follow the complete setup in your project's `docs/RUNNER_SETUP.md`.
+Follow the complete setup in your project's `docs/RUNNER_SETUP.md`.
 
 ### Switching to a New Repository
 
-If you already have a runner configured for a different repo and need to switch:
+If you already have a runner configured for a different repo:
 
 ```bash
 # 1. Stop the current runner service
@@ -281,23 +283,15 @@ sudo ./svc.sh status
 
 ### Running Multiple Repos (Organization Runner)
 
-Instead of switching per-repo, you can register a runner at the **organization level**:
+Register a runner at the **organization level** instead:
 
 1. Go to: `github.com/organizations/YOUR_ORG/settings/actions/runners`
 2. Add a new runner at org level
 3. The runner will be available to all repos in that org
 
-### Troubleshooting
-
-| Issue | Solution |
-|-------|----------|
-| Job stuck in "Queued" | Runner not running or configured for different repo |
-| "Runner offline" in GitHub | Run `sudo ./svc.sh start` in `~/actions-runner` |
-| Permission denied | Ensure runner user has access to Android SDK / emulator |
-
 ---
 
-## 🔧 Troubleshooting
+## Troubleshooting
 
 | Issue | Solution |
 |-------|----------|
@@ -309,7 +303,7 @@ Instead of switching per-repo, you can register a runner at the **organization l
 
 ---
 
-## 🌟 Best Practices
+## Best Practices
 
 1. **Small, focused tasks** — "Add a logout button" works better than "Refactor the entire auth flow"
 2. **Context is King** — A detailed `ARCHITECTURE.md` helps the agent mimic your coding style
@@ -318,13 +312,7 @@ Instead of switching per-repo, you can register a runner at the **organization l
 
 ---
 
-| Document | Description |
-|----------|-------------|
-| [KMP Template](https://github.com/chrishonson/kmp-agentic-ci-template) | Example mobile project |
-
----
-
-## 🧪 Why This Exists
+## Why This Exists
 
 This project explores **agentic CI/CD**—the idea that an AI agent can:
 1. Receive high-level tasks
@@ -332,6 +320,12 @@ This project explores **agentic CI/CD**—the idea that an AI agent can:
 3. Verify correctness through existing guardrails (builds, tests, linters)
 4. Submit changes for human review via pull requests
 5. Iterate on feedback by continuing work on rejected PRs
+
+---
+
+| Document | Description |
+|----------|-------------|
+| [KMP Template](https://github.com/chrishonson/kmp-agentic-ci-template) | Example mobile project |
 
 ---
 
