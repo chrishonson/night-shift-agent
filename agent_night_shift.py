@@ -30,8 +30,16 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Defaults
+# Gemini CLI models (gemini-cli-core config/models.js, v0.25.1)
+# - gemini-2.5-pro
+# - gemini-2.5-flash
+# - gemini-2.5-flash-lite
+# - gemini-3-pro-preview
+# - gemini-3-flash-preview
+# Aliases: auto, auto-gemini-2.5, auto-gemini-3, pro, flash, flash-lite
+# Embedding: gemini-embedding-001
 DEFAULT_PROVIDER = "gemini"
-DEFAULT_MODEL_GEMINI = "gemini-2.5-flash-lite"
+DEFAULT_MODEL_GEMINI = "gemini-2.5-flash"
 DEFAULT_MODEL_OPENROUTER = "google/gemini-2.0-flash-exp:free"
 DEFAULT_MODEL_CLAUDE = "claude-3-5-sonnet-20241022" 
 DEFAULT_MODEL_OLLAMA = "deepseek-r1:32b"
