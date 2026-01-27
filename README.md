@@ -255,31 +255,6 @@ If your project includes UI tests that run on a self-hosted runner (like `connec
 
 Follow the complete setup in your project's `docs/RUNNER_SETUP.md`.
 
-### Switching to a New Repository
-
-If you already have a runner configured for a different repo:
-
-```bash
-# 1. Stop the current runner service
-cd ~/actions-runner
-sudo ./svc.sh stop
-
-# 2. Remove the old configuration
-./config.sh remove
-
-# 3. Get a new token from GitHub:
-#    Go to: GitHub → YOUR_NEW_REPO → Settings → Actions → Runners → New self-hosted runner
-#    Copy the registration token shown
-
-# 4. Configure for the new repo
-./config.sh --url https://github.com/OWNER/NEW_REPO --token YOUR_NEW_TOKEN
-
-# 5. Restart the service
-sudo ./svc.sh start
-
-# 6. Verify it's running
-sudo ./svc.sh status
-```
 
 ### Running Multiple Repos (Organization Runner)
 
