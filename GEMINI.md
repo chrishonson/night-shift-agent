@@ -112,3 +112,4 @@ Saved to `.agent_logs/` in the target project:
 - **Context Pruning**: Drops oldest message pairs when context exceeds 30k chars
 - **CI Monitoring**: After PR creation, polls GitHub Actions and attempts auto-fix on failures
 - **Subprocess Safety**: All subprocess calls use `stdin=subprocess.DEVNULL`
+- **Ollama KV Caching**: Uses `keep_alive=-1` to keep the model loaded indefinitely. Ollama's `/api/chat` automatically caches previous tokens in the KV cache, so the system prompt is only fully processed on the first call—subsequent calls only process new tokens.

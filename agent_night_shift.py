@@ -327,9 +327,17 @@ class ClaudeCLIProvider(LLMProvider):
             time.sleep(RETRY_BASE_DELAY * (2 ** attempt))
 
 class OllamaProvider(LLMProvider):
+    """Ollama provider with KV cache optimization.
+    
+    Ollama's /api/chat endpoint automatically caches previous tokens in the KV cache
+    as long as the model stays loaded. By setting keep_alive=-1, we keep the model
+    loaded indefinitely, so the system prompt is only fully processed on the first call.
+    Subsequent calls only process the new/delta tokens.
+    """
     def __init__(self, model=DEFAULT_MODEL_OLLAMA):
         self.model = model
         self.base_url = "http://localhost:11434/api/chat"  # Chat API endpoint
+        self.keep_alive = -1  # Keep model loaded indefinitely for KV cache persistence
 
     @property
     def name(self): return f"Ollama ({self.model})"
@@ -348,10 +356,14 @@ class OllamaProvider(LLMProvider):
         for attempt in range(MAX_RETRIES):
             try:
                 # Prepare JSON payload for Ollama /api/chat
+                # keep_alive=-1 keeps the model loaded indefinitely, preserving KV cache
+                # This means the system prompt is only fully tokenized on first call;
+                # subsequent calls reuse cached KV states for the prefix
                 data = {
                     "model": self.model,
                     "messages": messages,
                     "stream": False,
+                    "keep_alive": self.keep_alive,
                     "options": {
                         "temperature": 0.6,   # R1 models need non-zero temp
                         "num_ctx": 32768      # Large context for DeepSeek-R1
