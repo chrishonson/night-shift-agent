@@ -852,7 +852,7 @@ class NightShiftAgent:
         if not self.project_dir.exists():
             raise ValueError(f"Project dir not found: {project_dir}")
         os.chdir(self.project_dir)
-        load_dotenv(self.project_dir / '.env')
+
         
         # Set up file logging in the project directory
         self._setup_logging()
