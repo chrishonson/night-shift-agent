@@ -50,7 +50,7 @@ MAX_RETRIES = 2
 MAX_CI_FIX_ATTEMPTS = 5
 RETRY_BASE_DELAY = 5
 MAX_FILES_IN_CONTEXT = 50
-MAX_CONTEXT_CHARS = 30000
+MAX_CONTEXT_CHARS = 80000
 MAX_TOOL_OUTPUT_CHARS = 50000  # 50KB max per tool output to prevent context explosion
 REPLACE_STALL_THRESHOLD = 3
 REQUIRE_BUILD_VERIFICATION = True
@@ -1151,6 +1151,13 @@ RULES:
 - Tests go in: composeApp/src/commonTest/kotlin/... (mirror the main source structure)
 - You MUST call verify_build before considering the task complete
 - Coverage thresholds are enforced by koverVerify - ensure adequate test coverage
+
+CRITICAL - DO NOT HALLUCINATE:
+- NEVER generate fake "USER:" or "TOOL OUTPUT:" text - you are NOT simulating a conversation
+- STOP IMMEDIATELY after outputting a single <agent_action> tag - do not continue
+- The REAL tool output will be provided by the system in the next message - do NOT imagine it
+- If you find yourself writing "USER:" or "ASSISTANT:" in your response, STOP - that is wrong
+- Each response should contain AT MOST one <agent_action> block, then STOP
 """
         task_intro = f"TASK: {task}\n\nBegin by reading the relevant files to understand the current implementation."
         
@@ -1187,9 +1194,27 @@ RULES:
             response = self.llm.ask(messages)
             if not response: return False
             
+            # Hallucination Detection: Strip fake USER/TOOL OUTPUT content
+            # Some models (especially Gemini) hallucinate entire conversations
+            hallucination_patterns = [
+                r'\nUSER:.*',
+                r'\nTOOL OUTPUT.*',
+                r'\nASSISTANT:.*',
+                r'\n\u003cuser\u003e.*',
+                r'\n\u003ctool_output\u003e.*',
+            ]
+            original_len = len(response)
+            for pattern in hallucination_patterns:
+                match = re.search(pattern, response, re.IGNORECASE | re.DOTALL)
+                if match:
+                    response = response[:match.start()]
+                    break
+            if len(response) < original_len:
+                logger.warning(f"⚠️ Stripped {original_len - len(response)} chars of hallucinated content")
+            
             messages.append({"role": "assistant", "content": response})
             
-            # Extract Actions
+            # Extract Actions (only process FIRST action to prevent hallucination cascades)
             actions = re.findall(r'<agent_action>(.*?)</agent_action>', response, re.DOTALL)
             if not actions and "{" in response:
                 # Fallback: Robustly find JSON objects using decoder to handle nesting
@@ -1210,6 +1235,11 @@ RULES:
                             pos = start + 1
                 except Exception as e:
                     logger.warning(f"⚠️ JSON Fallback extraction error: {e}")
+            
+            # Only process FIRST action to prevent hallucination cascades
+            if len(actions) > 1:
+                logger.warning(f"⚠️ Found {len(actions)} actions in response, only processing first one")
+                actions = actions[:1]
             
             tool_run = False
             for action_str in actions:
