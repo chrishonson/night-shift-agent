@@ -520,7 +520,13 @@ class ProviderManager:
         openrouter_p = OpenRouterAPIProvider() # Fallback to openrouter
         
         # User preferred order: Gemini -> Claude -> OpenRouter -> Ollama
-        self.providers = [gemini_p, claude_p, openrouter_p, ollama_p]
+        force_provider = os.getenv("FORCE_PROVIDER", "").lower()
+
+        if force_provider == "ollama":
+            self.providers = [ollama_p]
+            logger.info(f"🔌 FORCE_PROVIDER=ollama: Limited to Ollama only.")
+        else:
+            self.providers = [gemini_p, claude_p, openrouter_p, ollama_p]
             
         logger.info(f"🔌 Provider Chain: {[p.name for p in self.providers]}")
 
@@ -576,6 +582,12 @@ class Toolbox:
     def exec_command(self, command: str, env: dict = None, timeout: int = 600) -> subprocess.CompletedProcess:
         """Centralized helper for safe subprocess execution."""
         if env is None: env = os.environ.copy()
+        
+        # Ensure /opt/homebrew/bin is in PATH for Mac
+        path = env.get("PATH", "")
+        if "/opt/homebrew/bin" not in path:
+             env["PATH"] = f"/opt/homebrew/bin:{path}"
+
         try:
             return subprocess.run(
                 command,
@@ -885,6 +897,12 @@ class NightShiftAgent:
 
     def run_cmd_quiet(self, cmd):
         env = os.environ.copy()
+        
+        # Ensure /opt/homebrew/bin is in PATH for Mac
+        path = env.get("PATH", "")
+        if "/opt/homebrew/bin" not in path:
+             env["PATH"] = f"/opt/homebrew/bin:{path}"
+             
         if self.gh_token: env["GITHUB_TOKEN"] = self.gh_token
         return subprocess.run(cmd, shell=True, capture_output=True, text=True, env=env, stdin=subprocess.DEVNULL)
 
@@ -901,10 +919,20 @@ class NightShiftAgent:
     def create_branch(self):
         # Check current branch
         current = self.run_cmd_quiet("git branch --show-current").stdout.strip()
+        
+        # If already on a nightshift branch, reuse it
         if current.startswith(BRANCH_PREFIX + "/"):
             logger.info(f"🌿 Reusing existing branch: {current}")
             return current
+        
+        # If on a feature branch (not main), stay on it and work there
+        if current and current != "main":
+            logger.info(f"🌿 Working on existing feature branch: {current}")
+            # Pull latest changes for this branch if it has a remote
+            pull_result = self.run_cmd_quiet(f"git pull origin {current} 2>/dev/null || true")
+            return current
 
+        # Only create new nightshift branch when on main
         ts = datetime.now().strftime('%Y%m%d-%H%M%S')
         branch = f"{BRANCH_PREFIX}/{ts}"
         self.run_cmd_quiet("git checkout main")
@@ -935,9 +963,10 @@ class NightShiftAgent:
         logger.info("✅ Changes committed")
         return True
 
-    def push_and_create_pr(self, completed: list, branch: str):
+    def push_and_create_pr(self, completed: list, branch: str) -> bool:
+        """Push branch and create PR. Returns True if PR was created/exists, False if no commits."""
         logger.info(f"🚀 Pushing branch {branch}...")
-        self.toolbox.run_shell(f"git push -u origin {branch}")
+        push_result = self.toolbox.run_shell(f"git push -u origin {branch}")
         
         # Build nice PR title and body
         tasks_succeeded = len(completed)
@@ -946,8 +975,26 @@ class NightShiftAgent:
         pr_body = f"## 🌙 Night Shift Agent Report\\n\\n**Tasks**: {tasks_succeeded}\\n\\n{task_list}"
         
         # Create PR
-        logger.info("Compare URL: " + self.toolbox.run_shell(f'gh pr create --title "{pr_title}" --body "{pr_body}" --head {branch} --base main'))
-        # We don't fail if PR usage exists (might be updating existing branch)
+        pr_result = self.toolbox.run_shell(f'gh pr create --title "{pr_title}" --body "{pr_body}" --head {branch} --base main')
+        logger.info("Compare URL: " + pr_result)
+        
+        # Check for "no commits" error - this means there's nothing to PR
+        if "No commits between" in pr_result:
+            logger.warning("⚠️ No new commits to create PR. All tasks may have been completed in previous runs.")
+            return False
+        
+        # Check if PR already exists (not an error)
+        if "already exists" in pr_result.lower():
+            logger.info("✅ PR already exists, will monitor existing PR.")
+            return True
+            
+        # Check for other errors
+        if "Command failed" in pr_result and "No commits between" not in pr_result:
+            logger.warning(f"⚠️ PR creation may have issues: {pr_result}")
+            # Still return True to attempt monitoring - the PR might already exist
+            return True
+            
+        return True
 
     def monitor_pr(self, branch: str):
         logger.info("\n" + "="*60)
@@ -1353,9 +1400,9 @@ CRITICAL - DO NOT HALLUCINATE:
         if not tasks_file.exists():
             return
             
-        with open(tasks_file) as f: tasks = [l.strip() for l in f if l.strip() and not l.startswith("[x]")]
+        with open(tasks_file) as f: all_tasks = [l.strip() for l in f if l.strip()]
         
-        if not tasks: return
+        if not all_tasks: return  # Truly empty file
 
         branch = self.create_branch()
         
@@ -1374,7 +1421,16 @@ CRITICAL - DO NOT HALLUCINATE:
         files = self.toolbox.list_files()
 
         completed_tasks = []
-        for task in tasks:
+        
+        # First pass: check for already completed tasks to include in PR
+        for task in all_tasks:
+            if task.startswith("[x]"):
+                 clean_task = task.replace("[x]", "").replace("[!]", "").strip()
+                 completed_tasks.append(clean_task)
+
+        for task in all_tasks:
+            if task.startswith("[x]"): continue # Skip already done
+
             logger.info(f"▶️ Processing: {task}")
             # Clean task string handling
             clean_task = task.replace("[ ]", "").replace("[!]", "").strip()
@@ -1383,8 +1439,12 @@ CRITICAL - DO NOT HALLUCINATE:
                 try:
                     tasks_file = self.project_dir / "tasks.txt"
                     if os.path.exists(tasks_file):
-                        content = open(tasks_file).read().replace(task, f"[x] {clean_task}")
-                        open(tasks_file, "w").write(content)
+                        # Re-read to ensure we don't overwrite other parallel changes
+                        current_content = open(tasks_file).read()
+                        # Replace the specific line
+                        # We use the original task string to find it
+                        new_content = current_content.replace(task, f"[x] {clean_task}")
+                        open(tasks_file, "w").write(new_content)
                         logger.info(f"✅ Marked task complete in tasks.txt: {clean_task}")
                     else:
                         logger.warning(f"⚠️ tasks.txt not found. Creating new one with completed task.")
@@ -1394,13 +1454,23 @@ CRITICAL - DO NOT HALLUCINATE:
                     logger.error(f"❌ Failed to update tasks.txt: {e}")
 
                 # Commit this task's changes (including tasks.txt update)
-                if self.commit_changes(clean_task):
-                    completed_tasks.append(clean_task)
+                # We try to commit. If it returns True (committed) OR False (no changes but task done), we record success.
+                # Actually, if build passed, we consider it done.
+                self.commit_changes(clean_task)
+                completed_tasks.append(clean_task)
 
-        # Push and create PR only AFTER all tasks are done
+        # Check for any uncommitted changes (like .gitignore or tasks.txt from previous runs)
+        # This handles the case where a task was marked [x] but the commit failed/agent crashed
+        if self.commit_changes("Update task status"):
+             logger.info("✅ Committed pending task status updates")
+
+        # Push and create PR if we have ANY completed tasks (new or old)
         if completed_tasks:
-            self.push_and_create_pr(completed_tasks, branch)
-            self.monitor_pr(branch)
+            pr_created = self.push_and_create_pr(completed_tasks, branch)
+            if pr_created:
+                self.monitor_pr(branch)
+            else:
+                logger.info("✅ No PR to monitor. Agent complete.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
