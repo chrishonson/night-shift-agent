@@ -39,7 +39,7 @@ load_dotenv()
 # Aliases: auto, auto-gemini-2.5, auto-gemini-3, pro, flash, flash-lite
 # Embedding: gemini-embedding-001
 DEFAULT_PROVIDER = "gemini"
-DEFAULT_MODEL_GEMINI = "gemini-2.5-flash"
+DEFAULT_MODEL_GEMINI = "gemini-3-flash-preview"
 DEFAULT_MODEL_OPENROUTER = "google/gemini-2.0-flash-exp:free"
 DEFAULT_MODEL_CLAUDE = "claude-3-5-sonnet-20241022" 
 DEFAULT_MODEL_OLLAMA = "deepseek-r1:32b"
@@ -196,7 +196,7 @@ class GeminiCLIProvider(LLMProvider):
             prompt = prompt_or_messages
             
         prompt_logger.debug(
-            f"{'='*80}\n>>> PROMPT TO {self.name}\n{'='*80}\n{prompt[:2000]}\n{'='*80}\n"
+            f"{'='*80}\n>>> PROMPT TO {self.name}\n{'='*80}\n{prompt}\n{'='*80}\n"
         )
         
         for attempt in range(MAX_RETRIES):
@@ -271,7 +271,7 @@ class ClaudeCLIProvider(LLMProvider):
             prompt = prompt_or_messages
             
         prompt_logger.debug(
-            f"{'='*80}\n>>> PROMPT TO {self.name}\n{'='*80}\n{prompt[:2000]}\n{'='*80}\n"
+            f"{'='*80}\n>>> PROMPT TO {self.name}\n{'='*80}\n{prompt}\n{'='*80}\n"
         )
         
         for attempt in range(MAX_RETRIES):
@@ -350,7 +350,7 @@ class OllamaProvider(LLMProvider):
             messages = prompt_or_messages
         
         prompt_logger.debug(
-            f"{'='*80}\n>>> PROMPT TO {self.name}\n{'='*80}\n{json.dumps(messages, indent=2)[:2000]}\n{'='*80}\n"
+            f"{'='*80}\n>>> PROMPT TO {self.name}\n{'='*80}\n{json.dumps(messages, indent=2)}\n{'='*80}\n"
         )
         
         for attempt in range(MAX_RETRIES):
@@ -385,9 +385,6 @@ class OllamaProvider(LLMProvider):
                     # Chat API returns message.content
                     raw_text = result.get("message", {}).get("content", "")
                     
-                    # Strip <think>...</think> blocks from reasoning models
-                    raw_text = re.sub(r'<think>.*?</think>', '', raw_text, flags=re.DOTALL)
-                    
                     parsed = self.strip_markdown_code_blocks(raw_text.strip())
                     
                     prompt_logger.debug(f"{'='*80}\n<<< PARSED RESPONSE\n{'='*80}\n{parsed}\n{'='*80}\n")
@@ -402,7 +399,7 @@ class OllamaProvider(LLMProvider):
     def _log_raw_response(self, attempt, body):
          prompt_logger.debug(
             f"{'='*80}\n<<< RAW RESPONSE ({attempt+1})\n{'='*80}\n"
-            f"{body[:1000]}... (truncated)\n{'='*80}\n"
+            f"{body}\n{'='*80}\n"
         )
 
     def _backoff(self, attempt):
@@ -437,7 +434,7 @@ class OpenRouterAPIProvider(LLMProvider):
             messages = [{"role": "user", "content": prompt_or_messages}]
 
         prompt_logger.debug(
-            f"{'='*80}\n>>> PROMPT TO {self.name}\n{'='*80}\n{json.dumps(messages, indent=2)[:2000]}\n{'='*80}\n"
+            f"{'='*80}\n>>> PROMPT TO {self.name}\n{'='*80}\n{json.dumps(messages, indent=2)}\n{'='*80}\n"
         )
         
         # We need generic requests, but trying to avoid external deps if possible.
