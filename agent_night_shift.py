@@ -158,9 +158,6 @@ from typing import List, Optional
 class LLMProvider(ABC):
     """Abstract base class for LLM providers (CLI or API)."""
     
-    def __init__(self):
-        self.last_tokens = {"input": 0, "output": 0}
-
     @abstractmethod
     def ask(self, prompt_or_messages) -> Optional[str]:
         """Sends prompt (str) or messages (list of dicts) to the model and returns text response."""
@@ -263,10 +260,6 @@ class GeminiCLIProvider(LLMProvider):
             # Extract content from various potential CLI JSON schemas
             response_text = data.get("response") or data.get("content") or json.dumps(data)
             parsed = self.strip_markdown_code_blocks(response_text)
-            self.last_tokens = {
-                "input": max(1, len(self._last_prompt) // 4) if self._last_prompt else 0,
-                "output": max(1, len(parsed) // 4)
-            }
             prompt_logger.debug(f"{'='*80}\n<<< PARSED RESPONSE\n{'='*80}\n{parsed}\n{'='*80}\n")
             return parsed
         except json.JSONDecodeError:
@@ -319,10 +312,6 @@ class ClaudeCLIProvider(LLMProvider):
                         continue
                     
                     parsed = self.strip_markdown_code_blocks(result.stdout.strip())
-                    self.last_tokens = {
-                        "input": max(1, len(prompt) // 4),
-                        "output": max(1, len(parsed) // 4)
-                    }
                     prompt_logger.debug(f"{'='*80}\n<<< PARSED RESPONSE\n{'='*80}\n{parsed}\n{'='*80}\n")
                     return parsed
                     
@@ -413,10 +402,6 @@ class OllamaProvider(LLMProvider):
                     raw_text = result.get("message", {}).get("content", "")
                     
                     parsed = self.strip_markdown_code_blocks(raw_text.strip())
-                    self.last_tokens = {
-                        "input": int(result.get("prompt_eval_count") or max(1, len(str(messages)) // 4)),
-                        "output": int(result.get("eval_count") or max(1, len(parsed) // 4))
-                    }
                     
                     prompt_logger.debug(f"{'='*80}\n<<< PARSED RESPONSE\n{'='*80}\n{parsed}\n{'='*80}\n")
                     return parsed
@@ -501,11 +486,6 @@ class OpenRouterAPIProvider(LLMProvider):
                          
                     content = resp_data['choices'][0]['message']['content']
                     parsed = self.strip_markdown_code_blocks(content)
-                    usage = resp_data.get("usage", {})
-                    self.last_tokens = {
-                        "input": int(usage.get("prompt_tokens") or max(1, len(str(messages)) // 4)),
-                        "output": int(usage.get("completion_tokens") or max(1, len(parsed) // 4))
-                    }
                     prompt_logger.debug(f"{'='*80}\n<<< PARSED RESPONSE\n{'='*80}\n{parsed}\n{'='*80}\n")
                     return parsed
 
@@ -538,32 +518,20 @@ class ProviderManager:
     def __init__(self):
         self.providers: List[LLMProvider] = []
         self.current_index = 0  # Persist which provider is working
-        self.session_tokens = {"input": 0, "output": 0}
         # FORCE_PROVIDER=ollama pins the chain to local for the whole process.
-        # The usage loop may not lift that pin: an operator saying "local only"
-        # outranks an allowance saying "there is subscription left".
         self.pinned_local = os.getenv("FORCE_PROVIDER", "").lower() == "ollama"
-        self.local_only = self.pinned_local
         if self.pinned_local:
-            logger.info("🔌 FORCE_PROVIDER=ollama: pinned to local inference, usage policy will not override.")
+            logger.info("🔌 FORCE_PROVIDER=ollama: pinned to local inference.")
         self._init_providers()
-
-    def reset_session_tokens(self):
-        self.session_tokens = {"input": 0, "output": 0}
-
-    def get_session_tokens(self) -> dict:
-        return dict(self.session_tokens)
 
     def _init_providers(self):
         # Determine order based on env preference
         gemini_model = os.getenv("PREFERRED_AGENT_MODEL", DEFAULT_MODEL_GEMINI)
         ollama_model = os.getenv("OLLAMA_MODEL", DEFAULT_MODEL_OLLAMA)
 
-        if self.local_only:
+        if self.pinned_local:
             self.providers = [OllamaProvider(model=ollama_model)]
         else:
-            # Subscription capacity first, local last: paid allowance left
-            # unspent when the usage window closes is lost.
             self.providers = [
                 GeminiCLIProvider(model=gemini_model),
                 ClaudeCLIProvider(),
@@ -573,14 +541,6 @@ class ProviderManager:
 
         self.current_index = 0
         logger.info(f"🔌 Provider Chain: {[p.name for p in self.providers]}")
-
-    def set_local_only(self, local_only: bool) -> bool:
-        """Move between the subscription chain and local-only. Returns True if the chain changed."""
-        if self.pinned_local or local_only == self.local_only:
-            return False
-        self.local_only = local_only
-        self._init_providers()
-        return True
 
     def ask(self, prompt: str) -> Optional[str]:
         # Start from the last working provider, not always from 0
@@ -593,10 +553,6 @@ class ProviderManager:
             try:
                 result = provider.ask(prompt)
                 if result is not None:
-                    tokens = getattr(provider, "last_tokens", None)
-                    if tokens:
-                        self.session_tokens["input"] += tokens.get("input", 0)
-                        self.session_tokens["output"] += tokens.get("output", 0)
                     self.current_index = i
                     return result
                 
@@ -1107,7 +1063,7 @@ class ControlPlaneClient:
     def heartbeat(self, run_id: str) -> dict:
         return self.call_tool("card_heartbeat", {"run_id": run_id})
 
-    def release(self, run_id: str, outcome: str, gates: list = None, artifacts: dict = None, tokens: dict = None, error: str = None) -> dict:
+    def release(self, run_id: str, outcome: str, gates: list = None, artifacts: dict = None, error: str = None) -> dict:
         args = {
             "run_id": run_id,
             "outcome": outcome
@@ -1116,8 +1072,6 @@ class ControlPlaneClient:
             args["gates"] = gates
         if artifacts is not None:
             args["artifacts"] = artifacts
-        if tokens is not None:
-            args["tokens"] = tokens
         if error is not None:
             args["error"] = error[:4096]
         return self.call_tool("card_release", args)
@@ -1127,41 +1081,6 @@ class ControlPlaneClient:
 
     def snapshot(self) -> dict:
         return self.call_tool("board_snapshot", {})
-
-    def usage_report(self) -> dict:
-        return self.call_tool("usage_report", {})
-
-
-def decide_inference_mode(self_usage: Optional[dict]) -> tuple:
-    """Choose the inference tier from a usage_report `self` entry.
-
-    Returns (local_only, reason). The control plane owns the policy, so this
-    reads its verdict rather than recomputing it. Three cases, per usagePolicy.ts:
-
-    - allowance is null: undeclared, which means unmetered. Keep spending. This
-      is not "zero" and it is never exhausted.
-    - exhausted: the declared allowance is used up in the open window. Fall back
-      to local inference until the window rolls, which it does lazily.
-    - otherwise: subscription capacity remains, and capacity left unspent when
-      the window closes is lost. Keep spending.
-    """
-    if not self_usage:
-        return False, "no usage entry returned; assuming subscription capacity remains"
-
-    allowance = self_usage.get("allowance")
-    total = self_usage.get("total") or 0
-
-    if allowance is None:
-        return False, (
-            f"identity '{self_usage.get('identity_id', '?')}' declares no allowance, so it is "
-            f"unmetered and can never exhaust. Spent {total} tokens this window. "
-            "The local-inference fallback is wired but inert until an allowance is declared."
-        )
-
-    if self_usage.get("exhausted"):
-        return True, f"allowance exhausted ({total}/{allowance} tokens this window). Falling back to local inference."
-
-    return False, f"{self_usage.get('remaining')} of {allowance} tokens left this window. Keep spending the subscription."
 
 
 class LeaseHeartbeatWorker:
@@ -1266,35 +1185,6 @@ class NightShiftAgent:
         except Exception as e:
             logger.debug(f"Resource detection (adb): {e}")
         return resources
-
-    def apply_usage_policy(self) -> bool:
-        """Pick the inference tier for the card about to run. Returns True when local-only.
-
-        Called once per claimed card, not per LLM request. A card is the unit
-        that reports tokens on release, so it is the smallest interval at which
-        the control plane's view of the window can actually have changed; and
-        the window rolls on its own, so a decision taken before a long card may
-        be stale by the end of it, but re-deciding mid-card would swap the
-        provider under a running conversation.
-
-        A failed report leaves the current chain alone. Refusing to spend
-        subscription capacity because the bookkeeping call failed would be the
-        opposite of maxing it.
-        """
-        try:
-            report = self.control_plane.usage_report()
-        except Exception as e:
-            logger.warning(f"⚠️ usage_report failed ({e}). Staying on the current provider chain.")
-            return self.llm.local_only
-
-        local_only, reason = decide_inference_mode((report or {}).get("self"))
-        logger.info(f"📊 Usage window: {reason}")
-
-        if self.llm.set_local_only(local_only):
-            tier = "local inference (Ollama)" if local_only else "the subscription chain"
-            logger.info(f"🔀 Switched to {tier}.")
-
-        return self.llm.local_only
 
     def run_cmd_quiet(self, cmd):
         env = os.environ.copy()
@@ -1803,7 +1693,6 @@ CRITICAL - DO NOT HALLUCINATE:
 
         # Set up logging keyed to this run_id (observability join key)
         self._setup_logging(run_id=run_id)
-        self.llm.reset_session_tokens()
 
         orig_cwd = Path.cwd()
         target_dir = self.project_dir
@@ -1867,7 +1756,7 @@ CRITICAL - DO NOT HALLUCINATE:
             self.toolbox.project_dir = orig_cwd
 
     def run_swarm(self, lane: str = DEFAULT_LANE, max_runs: int = None, poll_interval_base: float = CONTROL_PLANE_POLL_INTERVAL_BASE):
-        """Swarm worker mode: poll controlPlaneMcp for ready cards in lane, execute with heartbeats, report tokens."""
+        """Swarm worker mode: poll controlPlaneMcp for ready cards in lane, execute with heartbeats."""
         logger.info(f"🐝 Night Shift starting in Swarm Worker mode (lane: {lane})...")
         runs_count = 0
 
@@ -1897,8 +1786,6 @@ CRITICAL - DO NOT HALLUCINATE:
             run_id = claim_result["run_id"]
             logger.info(f"🎯 Claimed card {card.get('id')}: '{card.get('title')}' (Run {run_id})")
 
-            self.apply_usage_policy()
-
             heartbeat = LeaseHeartbeatWorker(self.control_plane, run_id)
             heartbeat.start()
 
@@ -1916,15 +1803,13 @@ CRITICAL - DO NOT HALLUCINATE:
             finally:
                 heartbeat.stop()
 
-            tokens = self.llm.get_session_tokens()
             try:
-                logger.info(f"🏁 Releasing card {card.get('id')} (Run {run_id}) outcome={outcome}, tokens={tokens}")
+                logger.info(f"🏁 Releasing card {card.get('id')} (Run {run_id}) outcome={outcome}")
                 self.control_plane.release(
                     run_id=run_id,
                     outcome=outcome,
                     gates=gate_results,
                     artifacts=artifacts,
-                    tokens=tokens,
                     error=error_msg
                 )
             except Exception as e:

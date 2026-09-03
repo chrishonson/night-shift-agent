@@ -102,25 +102,6 @@ def plane(monkeypatch):
     return install
 
 
-def usage_entry(**overrides):
-    """A usage_report `self` entry in the shape usagePolicy.ts emits."""
-    entry = {
-        "identity_id": "night-shift-01",
-        "display_name": "Night Shift 01",
-        "window_start": 1788453185794,
-        "window_end": 1788471185794,
-        "input": 0, "output": 0, "total": 0, "runs": 0,
-        "allowance": None, "remaining": None, "exhausted": False,
-    }
-    entry.update(overrides)
-    return entry
-
-
-def usage_report_for(entry):
-    return {"generated_at": "2026-09-03T16:33:05.794Z", "window_seconds": 18000,
-            "identities": [entry], "self": entry}
-
-
 def claim_reply(card_id, run_id, **card_fields):
     card = {"id": card_id, "title": f"Card {card_id}", "goal": "do the thing", "kind": "task"}
     card.update(card_fields)
@@ -162,9 +143,8 @@ def test_request_ids_increment_across_calls(plane):
 
 
 def test_sse_framed_responses_are_parsed(plane):
-    entry = usage_entry(total=7)
-    _, client = plane(usage_report=sse_body(usage_report_for(entry)))
-    assert client.usage_report()["self"]["total"] == 7
+    _, client = plane(board_snapshot=sse_body({"cards": [{"id": "c1"}]}))
+    assert client.snapshot()["cards"][0]["id"] == "c1"
 
 
 def test_an_mcp_error_becomes_a_runtime_error(plane):
@@ -206,20 +186,18 @@ def test_claim_omits_resources_when_the_host_has_none(plane):
     assert stub.args_for("card_claim")[0] == {"lane": "local"}
 
 
-def test_release_carries_tokens_gates_and_artifacts(plane):
-    stub, client = plane(card_release={"usage": usage_entry(total=120)})
+def test_release_carries_gates_and_artifacts(plane):
+    stub, client = plane(card_release={})
     gates = [{"gate_id": "quality", "status": "passed", "duration_ms": 900}]
     artifacts = {"branch": "nightshift/c1", "commit_sha": "abc123"}
 
-    client.release(run_id="r1", outcome="succeeded", gates=gates,
-                   artifacts=artifacts, tokens={"input": 100, "output": 20})
+    client.release(run_id="r1", outcome="succeeded", gates=gates, artifacts=artifacts)
 
     assert stub.args_for("card_release")[0] == {
         "run_id": "r1",
         "outcome": "succeeded",
         "gates": gates,
         "artifacts": artifacts,
-        "tokens": {"input": 100, "output": 20},
     }
 
 
@@ -236,18 +214,10 @@ def test_release_truncates_the_error_to_the_contract_bound(plane):
     assert len(stub.args_for("card_release")[0]["error"]) == 4096
 
 
-def test_release_reports_zero_tokens_rather_than_omitting_them(plane):
-    stub, client = plane(card_release={})
-    client.release(run_id="r1", outcome="failed", tokens={"input": 0, "output": 0})
-    # A run that omits tokens is invisible to usage accounting; zero is a fact.
-    assert stub.args_for("card_release")[0]["tokens"] == {"input": 0, "output": 0}
-
-
-def test_decompose_and_usage_report_target_the_right_tools(plane):
-    stub, client = plane(card_decompose=[], usage_report=usage_report_for(usage_entry()))
+def test_decompose_targets_the_right_tool(plane):
+    stub, client = plane(card_decompose=[])
     client.decompose("parent-1", [{"title": "t", "goal": "g", "placement": ["local"]}])
-    client.usage_report()
-    assert stub.tools_called() == ["card_decompose", "usage_report"]
+    assert stub.tools_called() == ["card_decompose"]
     assert stub.args_for("card_decompose")[0]["parent_id"] == "parent-1"
 
 
@@ -317,17 +287,16 @@ def test_stopping_before_the_first_beat_is_safe(plane):
 
 
 # ---------------------------------------------------------------------------
-# Token accounting
+# Provider chain
 # ---------------------------------------------------------------------------
 
 class StubProvider(ns.LLMProvider):
-    """An LLM that costs a fixed, known number of tokens."""
+    """An LLM with a scripted reply, or a scripted failure."""
 
-    def __init__(self, label="stub", reply="ok", tokens=(10, 5), raises=None):
+    def __init__(self, label="stub", reply="ok", raises=None):
         super().__init__()
         self.label = label
         self.reply = reply
-        self.tokens = tokens
         self.raises = raises
         self.calls = 0
 
@@ -339,7 +308,6 @@ class StubProvider(ns.LLMProvider):
         self.calls += 1
         if self.raises:
             raise self.raises
-        self.last_tokens = {"input": self.tokens[0], "output": self.tokens[1]}
         return self.reply
 
 
@@ -349,143 +317,34 @@ def manager(monkeypatch):
     return ns.ProviderManager()
 
 
-def test_session_tokens_accumulate_across_requests(manager):
-    manager.providers = [StubProvider(tokens=(100, 40))]
-    manager.ask("one")
-    manager.ask("two")
-    assert manager.get_session_tokens() == {"input": 200, "output": 80}
-
-
-def test_session_tokens_accumulate_across_a_failover(manager):
+def test_a_quota_error_fails_over_to_the_next_provider(manager):
     manager.providers = [
         StubProvider(label="dead", raises=ns.QuotaExceededError("quota")),
-        StubProvider(label="alive", tokens=(7, 3)),
+        StubProvider(label="alive"),
     ]
     manager.current_index = 0
 
     assert manager.ask("hello") == "ok"
-    assert manager.get_session_tokens() == {"input": 7, "output": 3}
     # Failover is sticky: the next request should not re-probe the dead provider.
     assert manager.current_index == 1
 
 
-def test_the_counter_resets_between_cards(manager):
-    manager.providers = [StubProvider(tokens=(11, 4))]
-    manager.ask("card one work")
-    assert manager.get_session_tokens() == {"input": 11, "output": 4}
-
-    manager.reset_session_tokens()
-    assert manager.get_session_tokens() == {"input": 0, "output": 0}
-
-    manager.ask("card two work")
-    assert manager.get_session_tokens() == {"input": 11, "output": 4}
-
-
-def test_the_reported_counter_is_a_copy(manager):
-    manager.get_session_tokens()["input"] = 999
-    assert manager.get_session_tokens() == {"input": 0, "output": 0}
-
-
-# ---------------------------------------------------------------------------
-# Provider chain / tier switching
-# ---------------------------------------------------------------------------
-
 def test_the_default_chain_puts_subscription_first_and_local_last(manager):
-    assert manager.local_only is False
     assert isinstance(manager.providers[0], ns.GeminiCLIProvider)
     assert isinstance(manager.providers[-1], ns.OllamaProvider)
-
-
-def test_switching_to_local_leaves_only_ollama(manager):
-    assert manager.set_local_only(True) is True
-    assert [type(p) for p in manager.providers] == [ns.OllamaProvider]
-    assert manager.local_only is True
-
-
-def test_switching_back_restores_the_subscription_chain(manager):
-    manager.set_local_only(True)
-    assert manager.set_local_only(False) is True
     assert len(manager.providers) == 4
-    assert isinstance(manager.providers[0], ns.GeminiCLIProvider)
 
 
-def test_switching_to_the_current_tier_is_a_no_op(manager):
-    before = manager.providers
-    assert manager.set_local_only(False) is False
-    assert manager.providers is before
-
-
-def test_switching_tier_resets_the_sticky_provider_index(manager):
-    manager.current_index = 3
-    manager.set_local_only(True)
-    assert manager.current_index == 0
-
-
-def test_force_provider_pins_local_and_outranks_the_allowance(monkeypatch):
+def test_force_provider_pins_the_chain_to_local(monkeypatch):
     monkeypatch.setenv("FORCE_PROVIDER", "ollama")
     pinned = ns.ProviderManager()
 
     assert pinned.pinned_local is True
     assert [type(p) for p in pinned.providers] == [ns.OllamaProvider]
-    # An operator saying "local only" beats a control plane saying "spend more".
-    assert pinned.set_local_only(False) is False
-    assert [type(p) for p in pinned.providers] == [ns.OllamaProvider]
 
 
 # ---------------------------------------------------------------------------
-# decide_inference_mode: the three allowance cases
-# ---------------------------------------------------------------------------
-
-def test_under_a_declared_allowance_the_worker_keeps_spending():
-    local_only, reason = ns.decide_inference_mode(
-        usage_entry(input=300, output=100, total=400, allowance=1000, remaining=600)
-    )
-    assert local_only is False
-    assert "600 of 1000" in reason
-
-
-def test_an_exhausted_allowance_falls_back_to_local():
-    local_only, reason = ns.decide_inference_mode(
-        usage_entry(total=1000, allowance=1000, remaining=0, exhausted=True)
-    )
-    assert local_only is True
-    assert "exhausted" in reason
-
-
-def test_an_undeclared_allowance_is_unmetered_not_exhausted():
-    local_only, reason = ns.decide_inference_mode(
-        usage_entry(total=48000, allowance=None, remaining=None, exhausted=False)
-    )
-    # null means undeclared, which means unmetered. It is not zero, and a large
-    # spend against it is not a reason to stop.
-    assert local_only is False
-    assert "no allowance" in reason
-    assert "inert" in reason
-
-
-def test_an_undeclared_allowance_wins_over_a_stale_exhausted_flag():
-    # exhausted is only meaningful against a declared allowance; if a reply ever
-    # contradicts itself, the allowance is the field that decides.
-    assert ns.decide_inference_mode(usage_entry(allowance=None, exhausted=True))[0] is False
-
-
-def test_a_lapsed_window_reads_as_empty_and_resumes_spending():
-    # Windows reset lazily, so a rolled window arrives as a fresh zeroed entry
-    # rather than as a reset event.
-    local_only, reason = ns.decide_inference_mode(
-        usage_entry(total=0, allowance=1000, remaining=1000, exhausted=False)
-    )
-    assert local_only is False
-    assert "1000 of 1000" in reason
-
-
-def test_a_missing_usage_entry_does_not_pessimise_to_local():
-    assert ns.decide_inference_mode(None)[0] is False
-    assert ns.decide_inference_mode({})[0] is False
-
-
-# ---------------------------------------------------------------------------
-# apply_usage_policy and run_swarm, on a real agent
+# run_swarm, on a real agent
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
@@ -510,80 +369,14 @@ def wire(monkeypatch, agent):
     return install
 
 
-def test_the_policy_stays_on_subscription_under_an_allowance(agent, wire):
-    wire(usage_report=usage_report_for(usage_entry(total=400, allowance=1000, remaining=600)))
-
-    assert agent.apply_usage_policy() is False
-    assert agent.llm.local_only is False
-    assert len(agent.llm.providers) == 4
-
-
-def test_the_policy_switches_to_local_when_exhausted(agent, wire):
-    wire(usage_report=usage_report_for(
-        usage_entry(total=1000, allowance=1000, remaining=0, exhausted=True)
-    ))
-
-    assert agent.apply_usage_policy() is True
-    assert [type(p) for p in agent.llm.providers] == [ns.OllamaProvider]
-
-
-def test_the_policy_returns_to_subscription_when_the_window_rolls(agent, wire):
-    windows = [
-        usage_report_for(usage_entry(total=1000, allowance=1000, remaining=0, exhausted=True)),
-        usage_report_for(usage_entry(total=0, allowance=1000, remaining=1000)),
-    ]
-    wire(usage_report=lambda args: windows.pop(0))
-
-    assert agent.apply_usage_policy() is True
-    assert agent.apply_usage_policy() is False
-    assert len(agent.llm.providers) == 4
-
-
-def test_the_policy_is_wired_but_inert_when_no_allowance_is_declared(agent, wire, caplog):
-    # night-shift-01 declares none today, so this is the production path.
-    wire(usage_report=usage_report_for(usage_entry(total=125000)))
-
-    with caplog.at_level("INFO", logger="NightShiftAgent"):
-        assert agent.apply_usage_policy() is False
-
-    assert agent.llm.local_only is False
-    assert len(agent.llm.providers) == 4
-    assert any("inert" in record.message for record in caplog.records)
-
-
-def test_a_failed_usage_report_leaves_the_subscription_chain_alone(agent, wire):
-    wire(usage_report=RuntimeError("timeout"))
-
-    # Refusing to spend because the bookkeeping call failed is the opposite of maxing.
-    assert agent.apply_usage_policy() is False
-    assert len(agent.llm.providers) == 4
-
-
-def test_a_failed_usage_report_does_not_drag_a_local_worker_back_to_paid(agent, wire):
-    replies = [
-        usage_report_for(usage_entry(total=1000, allowance=1000, remaining=0, exhausted=True)),
-        RuntimeError("timeout"),
-    ]
-    wire(usage_report=lambda args: replies.pop(0))
-
-    assert agent.apply_usage_policy() is True
-    assert agent.apply_usage_policy() is True
-    assert [type(p) for p in agent.llm.providers] == [ns.OllamaProvider]
-
-
-def test_the_swarm_reports_each_cards_own_token_spend(agent, wire):
+def test_the_swarm_releases_each_claimed_card_with_its_own_result(agent, wire):
     claims = [claim_reply("c1", "r1"), claim_reply("c2", "r2")]
     stub = wire(
         card_claim=lambda args: claims.pop(0),
-        usage_report=usage_report_for(usage_entry()),
         card_release={},
     )
-    agent.llm.providers = [StubProvider(tokens=(100, 25))]
 
     def execute(card, run_id, heartbeat):
-        agent.llm.reset_session_tokens()   # what execute_card does per card
-        agent.llm.ask("work")
-        agent.llm.ask("more work")
         return "succeeded", [{"gate_id": "quality", "status": "passed", "duration_ms": 10}], None, None
 
     agent.execute_card = execute
@@ -592,37 +385,13 @@ def test_the_swarm_reports_each_cards_own_token_spend(agent, wire):
     releases = stub.args_for("card_release")
     assert [r["run_id"] for r in releases] == ["r1", "r2"]
     for release in releases:
-        # Per card, not cumulative across the process.
-        assert release["tokens"] == {"input": 200, "output": 50}
         assert release["outcome"] == "succeeded"
         assert release["gates"][0]["gate_id"] == "quality"
-
-
-def test_the_swarm_consults_usage_once_per_card(agent, wire):
-    claims = [claim_reply("c1", "r1"), claim_reply("c2", "r2")]
-    stub = wire(
-        card_claim=lambda args: claims.pop(0),
-        usage_report=usage_report_for(usage_entry()),
-        card_release={},
-    )
-    agent.execute_card = lambda card, run_id, hb: ("succeeded", [], None, None)
-
-    agent.run_swarm(lane="local", max_runs=2)
-
-    # Once per claimed card. Not per LLM request.
-    assert stub.count("usage_report") == 2
-
-
-def test_the_swarm_does_not_consult_usage_when_nothing_is_claimable(agent, wire):
-    stub = wire(card_claim={"claimed": None})
-    agent.run_swarm(lane="local", max_runs=0)
-    assert stub.count("usage_report") == 0
 
 
 def test_the_swarm_releases_failed_with_the_error_when_execution_raises(agent, wire):
     stub = wire(
         card_claim=claim_reply("c1", "r1"),
-        usage_report=usage_report_for(usage_entry()),
         card_release={},
     )
 
@@ -635,7 +404,6 @@ def test_the_swarm_releases_failed_with_the_error_when_execution_raises(agent, w
     released = stub.args_for("card_release")[0]
     assert released["outcome"] == "failed"
     assert "gate runner missing" in released["error"]
-    assert released["tokens"] == {"input": 0, "output": 0}
 
 
 def test_the_swarm_keeps_working_when_a_release_fails(agent, wire):
@@ -648,7 +416,6 @@ def test_the_swarm_keeps_working_when_a_release_fails(agent, wire):
 
     stub = wire(
         card_claim=lambda args: claims.pop(0),
-        usage_report=usage_report_for(usage_entry()),
         card_release=release,
     )
     agent.execute_card = lambda card, run_id, hb: ("succeeded", [], None, None)
@@ -660,55 +427,13 @@ def test_the_swarm_keeps_working_when_a_release_fails(agent, wire):
     assert stub.count("card_claim") == 2
 
 
-def test_a_card_claimed_while_exhausted_runs_on_local_inference(agent, wire):
-    wire(
-        card_claim=claim_reply("c1", "r1"),
-        usage_report=usage_report_for(
-            usage_entry(total=1000, allowance=1000, remaining=0, exhausted=True)
-        ),
-        card_release={},
-    )
-    seen = {}
-
-    def record(card, run_id, hb):
-        seen["chain"] = [type(p) for p in agent.llm.providers]
-        return "succeeded", [], None, None
-
-    agent.execute_card = record
-    agent.run_swarm(lane="local", max_runs=1)
-
-    # The tier is chosen before the card starts, so the whole card runs on it.
-    assert seen["chain"] == [ns.OllamaProvider]
-
-
 # ---------------------------------------------------------------------------
-# execute_card: per-card reset and abandonment
+# execute_card: abandonment and working-directory hygiene
 # ---------------------------------------------------------------------------
 
 class StubLease:
     def __init__(self, abandoned=False):
         self.abandoned = abandoned
-
-
-def test_execute_card_resets_the_token_counter_before_the_card_runs(agent):
-    agent.llm.providers = [StubProvider(tokens=(9, 3))]
-    agent.llm.ask("spend left over from a previous card")
-    assert agent.llm.get_session_tokens()["input"] == 9
-
-    seen = {}
-
-    def process(task, context, files):
-        seen["at_start"] = agent.llm.get_session_tokens()
-        return False
-
-    agent.process_task = process
-    outcome, _, _, error = agent.execute_card(
-        {"id": "c1", "title": "t", "goal": "g", "kind": "task"}, "r1", StubLease()
-    )
-
-    assert seen["at_start"] == {"input": 0, "output": 0}
-    assert outcome == "failed"
-    assert error
 
 
 def test_execute_card_reports_abandoned_when_the_lease_was_revoked(agent):
@@ -978,12 +703,12 @@ def test_a_missing_adb_is_not_fatal(agent, monkeypatch):
 
 def test_an_empty_reply_fails_over_to_the_next_provider(manager):
     silent = StubProvider(label="silent", reply=None)
-    answering = StubProvider(label="answering", reply="done", tokens=(4, 2))
+    answering = StubProvider(label="answering", reply="done")
     manager.providers = [silent, answering]
     manager.current_index = 0
 
     assert manager.ask("hello") == "done"
-    assert manager.get_session_tokens() == {"input": 4, "output": 2}
+    assert answering.calls == 1
 
 
 def test_a_chain_that_all_returns_empty_gives_up(manager):
@@ -991,7 +716,6 @@ def test_a_chain_that_all_returns_empty_gives_up(manager):
     manager.current_index = 0
 
     assert manager.ask("hello") is None
-    assert manager.get_session_tokens() == {"input": 0, "output": 0}
 
 
 def test_a_result_with_no_content_block_is_returned_as_is(plane):
