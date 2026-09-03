@@ -27,3 +27,12 @@ Thumbs.db
 
 # Test outputs
 *.log
+
+# Agent scratch output
+.artifacts/
+
+# Coverage
+.coverage
+coverage.json
+htmlcov/
+.pytest_cache/

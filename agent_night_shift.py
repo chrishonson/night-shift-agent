@@ -16,11 +16,15 @@ import re
 import time
 import json
 import urllib.request
+import urllib.error
 import logging
 import argparse
 import difflib
+import random
+import threading
 from datetime import datetime
 from pathlib import Path
+from typing import List, Optional, Tuple, Dict, Any
 from dotenv import load_dotenv
 
 # =============================================================================
@@ -28,6 +32,13 @@ from dotenv import load_dotenv
 # =============================================================================
 
 load_dotenv()
+
+# Control Plane defaults
+DEFAULT_CONTROL_PLANE_URL = "https://us-central1-my-brain-88870.cloudfunctions.net/controlPlaneMcp"
+DEFAULT_IDENTITY_ID = "night-shift-01"
+DEFAULT_LANE = "local"
+CONTROL_PLANE_POLL_INTERVAL_BASE = 45.0  # seconds
+CONTROL_PLANE_HEARTBEAT_INTERVAL = 60.0  # seconds
 
 # Defaults
 # Gemini CLI models (gemini-cli-core config/models.js, v0.25.1)
@@ -147,6 +158,9 @@ from typing import List, Optional
 class LLMProvider(ABC):
     """Abstract base class for LLM providers (CLI or API)."""
     
+    def __init__(self):
+        self.last_tokens = {"input": 0, "output": 0}
+
     @abstractmethod
     def ask(self, prompt_or_messages) -> Optional[str]:
         """Sends prompt (str) or messages (list of dicts) to the model and returns text response."""
@@ -183,7 +197,9 @@ class LLMProvider(ABC):
 
 class GeminiCLIProvider(LLMProvider):
     def __init__(self, model=DEFAULT_MODEL_GEMINI):
+        super().__init__()
         self.model = model
+        self._last_prompt = ""
         
     @property
     def name(self): return f"Gemini CLI ({self.model})"
@@ -194,6 +210,7 @@ class GeminiCLIProvider(LLMProvider):
             prompt = self.messages_to_string(prompt_or_messages)
         else:
             prompt = prompt_or_messages
+        self._last_prompt = prompt
             
         prompt_logger.debug(
             f"{'='*80}\n>>> PROMPT TO {self.name}\n{'='*80}\n{prompt}\n{'='*80}\n"
@@ -246,6 +263,10 @@ class GeminiCLIProvider(LLMProvider):
             # Extract content from various potential CLI JSON schemas
             response_text = data.get("response") or data.get("content") or json.dumps(data)
             parsed = self.strip_markdown_code_blocks(response_text)
+            self.last_tokens = {
+                "input": max(1, len(self._last_prompt) // 4) if self._last_prompt else 0,
+                "output": max(1, len(parsed) // 4)
+            }
             prompt_logger.debug(f"{'='*80}\n<<< PARSED RESPONSE\n{'='*80}\n{parsed}\n{'='*80}\n")
             return parsed
         except json.JSONDecodeError:
@@ -258,6 +279,7 @@ class GeminiCLIProvider(LLMProvider):
 
 class ClaudeCLIProvider(LLMProvider):
     def __init__(self, model=""):
+        super().__init__()
         self.model = model
         
     @property
@@ -297,6 +319,10 @@ class ClaudeCLIProvider(LLMProvider):
                         continue
                     
                     parsed = self.strip_markdown_code_blocks(result.stdout.strip())
+                    self.last_tokens = {
+                        "input": max(1, len(prompt) // 4),
+                        "output": max(1, len(parsed) // 4)
+                    }
                     prompt_logger.debug(f"{'='*80}\n<<< PARSED RESPONSE\n{'='*80}\n{parsed}\n{'='*80}\n")
                     return parsed
                     
@@ -335,6 +361,7 @@ class OllamaProvider(LLMProvider):
     Subsequent calls only process the new/delta tokens.
     """
     def __init__(self, model=DEFAULT_MODEL_OLLAMA):
+        super().__init__()
         self.model = model
         self.base_url = "http://localhost:11434/api/chat"  # Chat API endpoint
         self.keep_alive = -1  # Keep model loaded indefinitely for KV cache persistence
@@ -386,6 +413,10 @@ class OllamaProvider(LLMProvider):
                     raw_text = result.get("message", {}).get("content", "")
                     
                     parsed = self.strip_markdown_code_blocks(raw_text.strip())
+                    self.last_tokens = {
+                        "input": int(result.get("prompt_eval_count") or max(1, len(str(messages)) // 4)),
+                        "output": int(result.get("eval_count") or max(1, len(parsed) // 4))
+                    }
                     
                     prompt_logger.debug(f"{'='*80}\n<<< PARSED RESPONSE\n{'='*80}\n{parsed}\n{'='*80}\n")
                     return parsed
@@ -409,7 +440,7 @@ class OllamaProvider(LLMProvider):
 
 class OpenRouterAPIProvider(LLMProvider):
     def __init__(self):
-        pass  # Model and key read fresh on each request to allow runtime changes
+        super().__init__()
         
     @property
     def name(self): 
@@ -437,15 +468,12 @@ class OpenRouterAPIProvider(LLMProvider):
             f"{'='*80}\n>>> PROMPT TO {self.name}\n{'='*80}\n{json.dumps(messages, indent=2)}\n{'='*80}\n"
         )
         
-        # We need generic requests, but trying to avoid external deps if possible.
-        # But for OpenRouter, curl/requests is needed. Let's use standard lib urllib to avoid forcing 'requests' install.
-        
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
             "HTTP-Referer": "https://github.com/chrishonson/night-shift-agent",
         }
-        data = {
+        request_payload = {
             "model": model,
             "messages": messages
         }
@@ -455,7 +483,7 @@ class OpenRouterAPIProvider(LLMProvider):
                 req = urllib.request.Request(
                     "https://openrouter.ai/api/v1/chat/completions",
                     headers=headers,
-                    data=json.dumps(data).encode('utf-8')
+                    data=json.dumps(request_payload).encode('utf-8')
                 )
                 
                 with urllib.request.urlopen(req, timeout=60) as response:
@@ -463,19 +491,26 @@ class OpenRouterAPIProvider(LLMProvider):
                     # Log raw
                     self._log_raw_response(attempt, 200, resp_body)
                     
-                    data = json.loads(resp_body)
-                    if "error" in data:
+                    resp_data = json.loads(resp_body)
+                    if "error" in resp_data:
                          # Check for rate limits in API error
-                         err_msg = json.dumps(data['error']).lower()
+                         err_msg = json.dumps(resp_data['error']).lower()
                          if "rate limit" in err_msg or "quota" in err_msg or "insufficient" in err_msg:
                              raise QuotaExceededError(err_msg)
                          raise Exception(f"OpenRouter Error: {err_msg}")
                          
-                    content = data['choices'][0]['message']['content']
+                    content = resp_data['choices'][0]['message']['content']
                     parsed = self.strip_markdown_code_blocks(content)
+                    usage = resp_data.get("usage", {})
+                    self.last_tokens = {
+                        "input": int(usage.get("prompt_tokens") or max(1, len(str(messages)) // 4)),
+                        "output": int(usage.get("completion_tokens") or max(1, len(parsed) // 4))
+                    }
                     prompt_logger.debug(f"{'='*80}\n<<< PARSED RESPONSE\n{'='*80}\n{parsed}\n{'='*80}\n")
                     return parsed
 
+            except QuotaExceededError:
+                raise
             except urllib.error.HTTPError as e:
                 err_text = e.read().decode('utf-8')
                 self._log_raw_response(attempt, e.code, err_text)
@@ -503,29 +538,49 @@ class ProviderManager:
     def __init__(self):
         self.providers: List[LLMProvider] = []
         self.current_index = 0  # Persist which provider is working
+        self.session_tokens = {"input": 0, "output": 0}
+        # FORCE_PROVIDER=ollama pins the chain to local for the whole process.
+        # The usage loop may not lift that pin: an operator saying "local only"
+        # outranks an allowance saying "there is subscription left".
+        self.pinned_local = os.getenv("FORCE_PROVIDER", "").lower() == "ollama"
+        self.local_only = self.pinned_local
+        if self.pinned_local:
+            logger.info("🔌 FORCE_PROVIDER=ollama: pinned to local inference, usage policy will not override.")
         self._init_providers()
-        
+
+    def reset_session_tokens(self):
+        self.session_tokens = {"input": 0, "output": 0}
+
+    def get_session_tokens(self) -> dict:
+        return dict(self.session_tokens)
+
     def _init_providers(self):
         # Determine order based on env preference
         gemini_model = os.getenv("PREFERRED_AGENT_MODEL", DEFAULT_MODEL_GEMINI)
         ollama_model = os.getenv("OLLAMA_MODEL", DEFAULT_MODEL_OLLAMA)
-        
-        # Define all providers
-        ollama_p = OllamaProvider(model=ollama_model) # Primary: Local & Free
-        gemini_p = GeminiCLIProvider(model=gemini_model)
-        claude_p = ClaudeCLIProvider() # Default claude model
-        openrouter_p = OpenRouterAPIProvider() # Fallback to openrouter
-        
-        # User preferred order: Gemini -> Claude -> OpenRouter -> Ollama
-        force_provider = os.getenv("FORCE_PROVIDER", "").lower()
 
-        if force_provider == "ollama":
-            self.providers = [ollama_p]
-            logger.info(f"🔌 FORCE_PROVIDER=ollama: Limited to Ollama only.")
+        if self.local_only:
+            self.providers = [OllamaProvider(model=ollama_model)]
         else:
-            self.providers = [gemini_p, claude_p, openrouter_p, ollama_p]
-            
+            # Subscription capacity first, local last: paid allowance left
+            # unspent when the usage window closes is lost.
+            self.providers = [
+                GeminiCLIProvider(model=gemini_model),
+                ClaudeCLIProvider(),
+                OpenRouterAPIProvider(),
+                OllamaProvider(model=ollama_model)
+            ]
+
+        self.current_index = 0
         logger.info(f"🔌 Provider Chain: {[p.name for p in self.providers]}")
+
+    def set_local_only(self, local_only: bool) -> bool:
+        """Move between the subscription chain and local-only. Returns True if the chain changed."""
+        if self.pinned_local or local_only == self.local_only:
+            return False
+        self.local_only = local_only
+        self._init_providers()
+        return True
 
     def ask(self, prompt: str) -> Optional[str]:
         # Start from the last working provider, not always from 0
@@ -537,9 +592,22 @@ class ProviderManager:
             
             try:
                 result = provider.ask(prompt)
-                # Success! Remember this provider for next time
-                self.current_index = i
-                return result
+                if result is not None:
+                    tokens = getattr(provider, "last_tokens", None)
+                    if tokens:
+                        self.session_tokens["input"] += tokens.get("input", 0)
+                        self.session_tokens["output"] += tokens.get("output", 0)
+                    self.current_index = i
+                    return result
+                
+                logger.warning(f"⚠️ {provider.name} returned empty response. Switching...")
+                next_i = (i + 1) % len(self.providers)
+                if next_i != start_index:
+                    logger.info(f"🔄 Switching to: {self.providers[next_i].name}...")
+                    continue
+                else:
+                    logger.error("❌ All providers exhausted!")
+                    return None
             except QuotaExceededError:
                 logger.warning(f"🛑 {provider.name} Quota/Key Limit. Switching...")
                 next_i = (i + 1) % len(self.providers)
@@ -572,9 +640,14 @@ class ProviderManager:
 # =============================================================================
 
 class Toolbox:
-    def __init__(self, build_state: BuildState):
+    def __init__(self, build_state: BuildState, project_dir: Path = None):
         self.build_state = build_state
+        self.project_dir = Path(project_dir).resolve() if project_dir else Path.cwd()
         self.rate_limiter = RateLimiter()
+        self.target_gates = []  # Specific gate_ids declared on current card
+        self.last_gate_results = []  # GateResult list from last verification
+        self.control_plane = None  # Optional ControlPlaneClient
+        self.current_card_id = None
 
     def exec_command(self, command: str, env: dict = None, timeout: int = 600) -> subprocess.CompletedProcess:
         """Centralized helper for safe subprocess execution."""
@@ -596,7 +669,6 @@ class Toolbox:
                 stdin=subprocess.DEVNULL
             )
         except Exception as e:
-            # Create a fake failed result if execution blows up (e.g. OOM)
             logger.error(f"FATAL subprocess error: {e}")
             raise e
 
@@ -668,16 +740,17 @@ class Toolbox:
         
         try:
             with open(target, "r") as f: content = f.read()
-            if new_string in content: return f"Success: Text already present in {target}"
-            if old_string not in content: return f"Error: Text not found in {target}"
-            
-            with open(target, "w") as f: f.write(content.replace(old_string, new_string, 1))
-            
-            logger.info(f"✏️ Replaced text in: {target}")
-            self.build_state.files_changed_since_success.append(target)
-            self.build_state.build_passed = False
-            self.build_state.build_attempted = False
-            return f"Successfully replaced text in {target}"
+            if old_string in content:
+                with open(target, "w") as f: f.write(content.replace(old_string, new_string, 1))
+                logger.info(f"✏️ Replaced text in: {target}")
+                self.build_state.files_changed_since_success.append(target)
+                self.build_state.build_passed = False
+                self.build_state.build_attempted = False
+                return f"Successfully replaced text in {target}"
+            elif new_string in content:
+                return f"Success: Text already present in {target}"
+            else:
+                return f"Error: Text not found in {target}"
         except Exception as e: return f"Error: {e}"
     
     def list_files(self, path="."):
@@ -692,9 +765,6 @@ class Toolbox:
 
     def _parse_and_contextualize_errors(self, output: str) -> str:
         """Parses compiler errors, reads source files, and returns a focused error report."""
-        # Regex patterns for common Kotlin/Gradle errors
-        # 1. e: file:///path/to/File.kt:10:20: error: message
-        # 2. e: /path/to/File.kt: (10, 20): message
         error_patterns = [
             r"(?P<level>[ew]):\s+(?P<path>file://[^:]+|/[^:]+):\s*\(?(?P<line>\d+)[:,\s]+(?P<col>\d+)\)?:\s*(?P<msg>.*)",
             r"(?P<path>[^:\n]+\.kt):\s*(?P<line>\d+):\s*(?P<col>\d+):\s*error:\s*(?P<msg>.*)"
@@ -708,25 +778,21 @@ class Toolbox:
                 match = re.search(pattern, line)
                 if match:
                     path_str = match.group("path").strip()
-                    # Fix file:// prefix
                     if path_str.startswith("file://"):
                         path_str = path_str[7:]
                     
-                    # Normalize absolute paths
                     if os.path.exists(path_str):
                          files_to_read.add(os.path.abspath(path_str))
                     
                     extracted_errors.append(line)
-                    break # Single match per line
+                    break
                     
         if not extracted_errors:
-            # Fallback output if no specific errors parsed
              if len(output) > MAX_TOOL_OUTPUT_CHARS:
                 half = MAX_TOOL_OUTPUT_CHARS // 2
                 return output[:half] + "\n\n... [TRUNCATED] ...\n\n" + output[-half:]
              return output
 
-        # Read files
         file_contexts = []
         for file_path in files_to_read:
              try:
@@ -736,7 +802,6 @@ class Toolbox:
              except Exception as e:
                  file_contexts.append(f"--- FILE: {file_path} ---\n[Error reading file: {e}]\n")
         
-        # Assemble report
         report_parts = [
             "❌ BUILD FAILED - ERROR REPORT",
             "\n=== EXTRACTED ERRORS ==="
@@ -753,13 +818,19 @@ class Toolbox:
 
     def run_tests(self) -> str:
         """Run tests only (for TDD red/green phases). Does NOT count as final verification."""
-        TEST_CMD = "./gradlew testDebugUnitTest"
+        verification_file = self.project_dir / "verification.json"
+        run_gate_script = self.project_dir / "scripts" / "run-gate.py"
+
+        if verification_file.exists() and run_gate_script.exists():
+            test_cmd = f"python3 {run_gate_script} quality"
+        else:
+            test_cmd = "./gradlew testDebugUnitTest"
         
-        logger.info(f"🧪 Running tests: {TEST_CMD}")
+        logger.info(f"🧪 Running tests: {test_cmd}")
         
         env = os.environ.copy()
         try:
-            result = self.exec_command(TEST_CMD, env=env, timeout=300)
+            result = self.exec_command(test_cmd, env=env, timeout=300)
             output = result.stdout + result.stderr
             logger.debug(f"Full Test Output:\n{output}")
             
@@ -776,16 +847,73 @@ class Toolbox:
             logger.error(f"❌ Test error: {e}")
             return f"Error running tests: {e}"
 
-    def verify_build(self) -> str:
-        """Run the official verification build with coverage. This is the ONLY way to pass verification."""
+    def _verify_via_contract(self, verification_file: Path, run_gate_script: Path) -> str:
+        try:
+            with open(verification_file, "r") as f:
+                contract = json.load(f)
+        except Exception as e:
+            return f"Error reading verification contract: {e}"
+
+        gates_to_run = []
+        if self.target_gates:
+            gates_to_run = list(self.target_gates)
+        else:
+            for g in contract.get("gates", []):
+                if "local" in g.get("placement", []):
+                    gates_to_run.append(g["id"])
+
+        if not gates_to_run:
+            gates_to_run = ["quality"]
+
+        self.last_gate_results = []
+        all_passed = True
+        outputs = []
+
+        for gate_id in gates_to_run:
+            logger.info(f"🔍 Running contract gate: {gate_id}...")
+            start_ms = int(time.time() * 1000)
+            cmd = f"python3 {run_gate_script} {gate_id}"
+            res = self.exec_command(cmd)
+            duration_ms = int(time.time() * 1000) - start_ms
+
+            output = (res.stdout + res.stderr).strip()
+            if res.returncode == 0:
+                self.last_gate_results.append({
+                    "gate_id": gate_id,
+                    "status": "passed",
+                    "duration_ms": duration_ms
+                })
+                outputs.append(f"Gate '{gate_id}': PASSED ({duration_ms}ms)")
+            else:
+                all_passed = False
+                self.last_gate_results.append({
+                    "gate_id": gate_id,
+                    "status": "failed",
+                    "duration_ms": duration_ms
+                })
+                outputs.append(f"Gate '{gate_id}': FAILED ({duration_ms}ms)\n{output}")
+                break
+
+        self.build_state.build_attempted = True
+        self.build_state.build_passed = all_passed
+
+        if all_passed:
+            logger.info("✅ Contract verification PASSED on all gates")
+            if self.build_state.files_changed_since_success:
+                self.build_state.checkpoint(self.build_state.files_changed_since_success)
+            return "✅ CONTRACT VERIFICATION PASSED\n" + "\n".join(outputs)
+        else:
+            logger.warning("❌ Contract verification FAILED")
+            combined_output = "\n\n".join(outputs)
+            return f"❌ CONTRACT VERIFICATION FAILED\n\n{self._parse_and_contextualize_errors(combined_output)}"
+
+    def _verify_via_legacy(self) -> str:
         VERIFICATION_CMD = "./gradlew assembleDebug :composeApp:linkDebugFrameworkIosSimulatorArm64 detekt testDebugUnitTest koverVerify"
-        
         logger.info(f"🔍 Running verification build: {VERIFICATION_CMD}")
         
         env = os.environ.copy()
         try:
             result = self.exec_command(VERIFICATION_CMD, env=env)
-            
             self.build_state.build_attempted = True
             self.build_state.build_passed = (result.returncode == 0)
             
@@ -793,7 +921,6 @@ class Toolbox:
             logger.debug(f"Full Verification Output:\n{output}")
             
             if result.returncode == 0:
-                # Success - truncate if needed
                 if len(output) > MAX_TOOL_OUTPUT_CHARS:
                     output = output[-MAX_TOOL_OUTPUT_CHARS:]
                 logger.info("✅ Verification PASSED")
@@ -801,12 +928,32 @@ class Toolbox:
                     self.build_state.checkpoint(self.build_state.files_changed_since_success)
                 return f"✅ VERIFICATION PASSED (build + tests + coverage)\n\n{output}"
             else:
-                # Failure - use smart parsing
                 logger.warning(f"❌ Verification FAILED (Exit {result.returncode})")
                 return f"❌ VERIFICATION FAILED (exit {result.returncode}):\n\n{self._parse_and_contextualize_errors(output)}"
         except Exception as e:
             logger.error(f"❌ Verification error: {e}")
             return f"Error running verification: {e}"
+
+    def verify_build(self) -> str:
+        """Run the official verification build. Checks target repository contract first."""
+        verification_file = self.project_dir / "verification.json"
+        run_gate_script = self.project_dir / "scripts" / "run-gate.py"
+
+        if verification_file.exists() and run_gate_script.exists():
+            return self._verify_via_contract(verification_file, run_gate_script)
+        return self._verify_via_legacy()
+
+    def decompose(self, children: list = None, **kwargs) -> str:
+        if not self.control_plane or not self.current_card_id:
+            return "Error: Control plane decomposition not available for this task."
+        child_list = children or kwargs.get("child_cards", [])
+        if not child_list:
+            return "Error: No child cards specified for decomposition."
+        try:
+            res = self.control_plane.decompose(self.current_card_id, child_list)
+            return f"Successfully decomposed card into {len(res)} children."
+        except Exception as e:
+            return f"Decomposition failed: {e}"
 
     def dispatch(self, tool_name, args):
         mapping = {
@@ -814,12 +961,12 @@ class Toolbox:
             "run_shell": self.run_shell, "run_shell_command": self.run_shell,
             "replace": self.replace, "list_files": self.list_files,
             "run_tests": self.run_tests, "test": self.run_tests,  # TDD tool
-            "verify_build": self.verify_build, "verify": self.verify_build  # Alias
+            "verify_build": self.verify_build, "verify": self.verify_build,  # Alias
+            "decompose": self.decompose, "card_decompose": self.decompose
         }
         
         # Arg Normalization
         if tool_name in ["run_shell", "run_shell_command"]:
-            # Extensive alias mapping for creative models
             cmd = (args.get("command") or args.get("cmd") or args.get("code") or 
                    args.get("script") or args.get("command_line") or 
                    args.get("cli") or args.get("exec") or args.get("input") or args.get("bash"))
@@ -840,9 +987,8 @@ class Toolbox:
         if tool_name == "search_file_content":
             pattern = args.get("pattern", "")
             include = args.get("include", "*.kt")
-            # Convert to grep command and clear other args
             command = f"grep -rn '{pattern}' --include='{include}' ."
-            args = {"command": command}  # Clear all other args, only keep command
+            args = {"command": command}
             tool_name = "run_shell"
         
         logger.info(f"Arguments for {tool_name}: {args}")
@@ -851,46 +997,304 @@ class Toolbox:
         if func: return func(**args)
         return f"Unknown tool: {tool_name}. Available tools: {', '.join(mapping.keys())}"
 
+
+# =============================================================================
+# CONTROL PLANE CLIENT & LEASE WORKER
+# =============================================================================
+
+class ControlPlaneClient:
+    """Client for the control plane MCP server."""
+    def __init__(self, base_url: str = None, token: str = None, identity_id: str = DEFAULT_IDENTITY_ID):
+        raw_url = base_url or os.getenv("CONTROL_PLANE_URL", DEFAULT_CONTROL_PLANE_URL)
+        self.base_url = raw_url.rstrip("/")
+        self.identity_id = identity_id
+        self.token = token or self._resolve_token()
+        self.request_id = 0
+
+    def _resolve_token(self) -> Optional[str]:
+        # 1. Environment variable
+        token = os.getenv("CONTROL_PLANE_BEARER_TOKEN")
+        if token and token.strip():
+            return token.strip()
+
+        # 2. Secret Manager via gcloud (in-memory only, never persisted or logged)
+        secret_name = f"control-plane-{self.identity_id}"
+        project_id = os.getenv("GOOGLE_CLOUD_PROJECT", "my-brain-88870")
+        try:
+            cmd = ["gcloud", "secrets", "versions", "access", "latest", f"--secret={secret_name}", f"--project={project_id}"]
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            if proc.returncode == 0 and proc.stdout.strip():
+                return proc.stdout.strip()
+        except Exception as e:
+            logger.debug(f"Secret Manager resolution skipped/failed: {e}")
+
+        return None
+
+    def call_tool(self, name: str, arguments: dict = None, timeout: int = 30) -> dict:
+        if not self.token:
+            raise RuntimeError(
+                f"Bearer token for identity '{self.identity_id}' could not be resolved. "
+                "Set CONTROL_PLANE_BEARER_TOKEN or ensure gcloud has Secret Manager access."
+            )
+
+        self.request_id += 1
+        endpoint = f"{self.base_url}/mcp"
+        payload = {
+            "jsonrpc": "2.0",
+            "id": self.request_id,
+            "method": "tools/call",
+            "params": {
+                "name": name,
+                "arguments": arguments or {}
+            }
+        }
+
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            endpoint,
+            data=data,
+            headers={
+                "Authorization": f"Bearer {self.token}",
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/event-stream"
+            }
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                resp_text = resp.read().decode("utf-8")
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"Control plane call '{name}' failed HTTP {e.code}: {err_body}")
+        except Exception as e:
+            raise RuntimeError(f"Control plane call '{name}' failed: {e}")
+
+        response_obj = None
+        for line in resp_text.splitlines():
+            line_str = line.strip()
+            if line_str.startswith("data:"):
+                json_part = line_str[5:].strip()
+                if json_part:
+                    response_obj = json.loads(json_part)
+                    break
+
+        if not response_obj:
+            response_obj = json.loads(resp_text)
+
+        if "error" in response_obj:
+            err = response_obj["error"]
+            err_msg = err.get("message") if isinstance(err, dict) else str(err)
+            raise RuntimeError(f"MCP error in '{name}': {err_msg}")
+
+        result = response_obj.get("result", {})
+        content = result.get("content", [])
+        if content and isinstance(content, list) and len(content) > 0:
+            first = content[0]
+            if first.get("type") == "text":
+                return json.loads(first.get("text", "{}"))
+
+        return result
+
+    def claim(self, lane: str = DEFAULT_LANE, resources: list = None) -> Optional[dict]:
+        args = {"lane": lane}
+        if resources:
+            args["resources"] = resources
+        res = self.call_tool("card_claim", args)
+        if not res or (res.get("claimed") is None and "card" not in res):
+            return None
+        return res
+
+    def heartbeat(self, run_id: str) -> dict:
+        return self.call_tool("card_heartbeat", {"run_id": run_id})
+
+    def release(self, run_id: str, outcome: str, gates: list = None, artifacts: dict = None, tokens: dict = None, error: str = None) -> dict:
+        args = {
+            "run_id": run_id,
+            "outcome": outcome
+        }
+        if gates is not None:
+            args["gates"] = gates
+        if artifacts is not None:
+            args["artifacts"] = artifacts
+        if tokens is not None:
+            args["tokens"] = tokens
+        if error is not None:
+            args["error"] = error[:4096]
+        return self.call_tool("card_release", args)
+
+    def decompose(self, parent_id: str, children: list) -> list:
+        return self.call_tool("card_decompose", {"parent_id": parent_id, "children": children})
+
+    def snapshot(self) -> dict:
+        return self.call_tool("board_snapshot", {})
+
+    def usage_report(self) -> dict:
+        return self.call_tool("usage_report", {})
+
+
+def decide_inference_mode(self_usage: Optional[dict]) -> tuple:
+    """Choose the inference tier from a usage_report `self` entry.
+
+    Returns (local_only, reason). The control plane owns the policy, so this
+    reads its verdict rather than recomputing it. Three cases, per usagePolicy.ts:
+
+    - allowance is null: undeclared, which means unmetered. Keep spending. This
+      is not "zero" and it is never exhausted.
+    - exhausted: the declared allowance is used up in the open window. Fall back
+      to local inference until the window rolls, which it does lazily.
+    - otherwise: subscription capacity remains, and capacity left unspent when
+      the window closes is lost. Keep spending.
+    """
+    if not self_usage:
+        return False, "no usage entry returned; assuming subscription capacity remains"
+
+    allowance = self_usage.get("allowance")
+    total = self_usage.get("total") or 0
+
+    if allowance is None:
+        return False, (
+            f"identity '{self_usage.get('identity_id', '?')}' declares no allowance, so it is "
+            f"unmetered and can never exhaust. Spent {total} tokens this window. "
+            "The local-inference fallback is wired but inert until an allowance is declared."
+        )
+
+    if self_usage.get("exhausted"):
+        return True, f"allowance exhausted ({total}/{allowance} tokens this window). Falling back to local inference."
+
+    return False, f"{self_usage.get('remaining')} of {allowance} tokens left this window. Keep spending the subscription."
+
+
+class LeaseHeartbeatWorker:
+    """Background daemon thread maintaining the lease on an in-progress card."""
+    def __init__(self, client: ControlPlaneClient, run_id: str, interval: float = CONTROL_PLANE_HEARTBEAT_INTERVAL):
+        self.client = client
+        self.run_id = run_id
+        self.interval = interval
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._run, daemon=True, name=f"heartbeat-{run_id[:8]}")
+        self.abandoned = False
+
+    def start(self):
+        self.thread.start()
+
+    def _run(self):
+        while not self.stop_event.wait(self.interval):
+            try:
+                res = self.client.heartbeat(self.run_id)
+                expires = res.get("lease", {}).get("expires_at")
+                logger.debug(f"💓 Heartbeat extended for run {self.run_id} (expires at {expires})")
+            except Exception as e:
+                err_str = str(e).lower()
+                logger.warning(f"⚠️ Heartbeat failed for run {self.run_id}: {e}")
+                if "abandoned" in err_str or "not found" in err_str or "not held" in err_str:
+                    logger.error(f"🛑 Run {self.run_id} invalidated on control plane.")
+                    self.abandoned = True
+                    break
+
+    def stop(self):
+        self.stop_event.set()
+        if self.thread.is_alive():
+            self.thread.join(timeout=3)
+
 # =============================================================================
 # MAIN AGENT CONTROLLER
 # =============================================================================
 
 class NightShiftAgent:
-    def __init__(self, project_dir):
+    def __init__(self, project_dir=".", control_plane_url: str = None, token: str = None):
         self.project_dir = Path(project_dir).resolve()
         if not self.project_dir.exists():
             raise ValueError(f"Project dir not found: {project_dir}")
         os.chdir(self.project_dir)
 
-        
-        # Set up file logging in the project directory
-        self._setup_logging()
-        
+        self.control_plane = ControlPlaneClient(base_url=control_plane_url, token=token)
+        self.current_run_id = None
+        self.current_card = None
+
         self.build_state = BuildState()
-        self.toolbox = Toolbox(self.build_state)
+        self.toolbox = Toolbox(self.build_state, project_dir=self.project_dir)
+        self.toolbox.control_plane = self.control_plane
         self.llm = ProviderManager()
         self.bot_username = os.getenv("BOT_USERNAME", "agentnightshift")
         self.gh_token = os.getenv("GH_BOT_TOKEN")
+        self._current_file_handlers = []
     
-    def _setup_logging(self):
-        """Set up file handlers in the project directory."""
+        # Set up file logging in the project directory
+        self._setup_logging()
+
+    def _setup_logging(self, run_id: str = None):
+        """Set up file handlers in the project directory. If run_id is supplied, keys log by run_id."""
         log_dir = self.project_dir / ".agent_logs"
         log_dir.mkdir(exist_ok=True)
         
-        log_file = log_dir / f"session_{SESSION_TIMESTAMP}.log"
-        prompt_log_file = log_dir / f"prompts_{SESSION_TIMESTAMP}.log"
+        # Clean up prior file handlers if switching runs
+        for h in self._current_file_handlers:
+            logger.removeHandler(h)
+            prompt_logger.removeHandler(h)
+        self._current_file_handlers = []
+
+        tag = run_id or f"session_{SESSION_TIMESTAMP}"
+        log_file = log_dir / f"{tag}.log"
+        prompt_log_file = log_dir / f"prompts_{tag}.log"
         
         # Add file handler to main logger
         file_handler = logging.FileHandler(log_file)
         file_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s', '%Y-%m-%d %H:%M:%S'))
         logger.addHandler(file_handler)
+        self._current_file_handlers.append(file_handler)
         
         # Add file handler to prompt logger
         prompt_handler = logging.FileHandler(prompt_log_file)
         prompt_handler.setFormatter(logging.Formatter('%(asctime)s\n%(message)s\n'))
         prompt_logger.addHandler(prompt_handler)
+        self._current_file_handlers.append(prompt_handler)
         
-        logger.info(f"📁 Logging to: {log_dir}")
+        logger.info(f"📁 Logging to: {log_dir} ({tag})")
+
+    def detect_resources(self) -> list:
+        """Detect physical resources available on this host (e.g. attached Android device)."""
+        resources = []
+        try:
+            res = subprocess.run(["adb", "devices"], capture_output=True, text=True, timeout=3)
+            if res.returncode == 0:
+                lines = [l.strip() for l in res.stdout.strip().splitlines() if l.strip()]
+                for line in lines[1:]:
+                    parts = line.split()
+                    if len(parts) >= 2 and parts[1] in ("device", "unauthorized"):
+                        resources.append("android-device")
+                        break
+        except Exception as e:
+            logger.debug(f"Resource detection (adb): {e}")
+        return resources
+
+    def apply_usage_policy(self) -> bool:
+        """Pick the inference tier for the card about to run. Returns True when local-only.
+
+        Called once per claimed card, not per LLM request. A card is the unit
+        that reports tokens on release, so it is the smallest interval at which
+        the control plane's view of the window can actually have changed; and
+        the window rolls on its own, so a decision taken before a long card may
+        be stale by the end of it, but re-deciding mid-card would swap the
+        provider under a running conversation.
+
+        A failed report leaves the current chain alone. Refusing to spend
+        subscription capacity because the bookkeeping call failed would be the
+        opposite of maxing it.
+        """
+        try:
+            report = self.control_plane.usage_report()
+        except Exception as e:
+            logger.warning(f"⚠️ usage_report failed ({e}). Staying on the current provider chain.")
+            return self.llm.local_only
+
+        local_only, reason = decide_inference_mode((report or {}).get("self"))
+        logger.info(f"📊 Usage window: {reason}")
+
+        if self.llm.set_local_only(local_only):
+            tier = "local inference (Ollama)" if local_only else "the subscription chain"
+            logger.info(f"🔀 Switched to {tier}.")
+
+        return self.llm.local_only
 
     def run_cmd_quiet(self, cmd):
         env = os.environ.copy()
@@ -969,11 +1373,19 @@ class NightShiftAgent:
         tasks_succeeded = len(completed)
         pr_title = f"🌙 Night Shift: {tasks_succeeded} task(s)"
         task_list = "\n".join([f"- [x] {t}" for t in completed])
-        pr_body = f"## 🌙 Night Shift Agent Report\\n\\n**Tasks**: {tasks_succeeded}\\n\\n{task_list}"
+        pr_body = f"## 🌙 Night Shift Agent Report\n\n**Tasks**: {tasks_succeeded}\n\n{task_list}"
         
-        # Create PR
-        pr_result = self.toolbox.run_shell(f'gh pr create --title "{pr_title}" --body "{pr_body}" --head {branch} --base main')
-        logger.info("Compare URL: " + pr_result)
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.md') as f:
+            f.write(pr_body)
+            body_file = f.name
+
+        try:
+            pr_result = self.toolbox.run_shell(f'gh pr create --title "{pr_title}" --body-file "{body_file}" --head {branch} --base main')
+            logger.info("Compare URL: " + pr_result)
+        finally:
+            if os.path.exists(body_file):
+                os.unlink(body_file)
         
         # Check for "no commits" error - this means there's nothing to PR
         if "No commits between" in pr_result:
@@ -988,7 +1400,6 @@ class NightShiftAgent:
         # Check for other errors
         if "Command failed" in pr_result and "No commits between" not in pr_result:
             logger.warning(f"⚠️ PR creation may have issues: {pr_result}")
-            # Still return True to attempt monitoring - the PR might already exist
             return True
             
         return True
@@ -999,51 +1410,35 @@ class NightShiftAgent:
         logger.info("="*60)
         
         ci_passed = False
+        fix_attempts = 0
         
         for poll in range(MAX_CI_WAIT_POLLS):
             logger.info(f"⏳ Poll {poll + 1}/{MAX_CI_WAIT_POLLS}: Waiting {CI_POLL_INTERVAL}s for CI...")
             time.sleep(CI_POLL_INTERVAL)
             
             # Check PR status via GH CLI
-            # We look for the statusCheckRollup to see if checks are passing/failing
             cmd = f"gh pr view {branch} --json statusCheckRollup,state,mergeable --jq '{{state: .state, checks: .statusCheckRollup, mergeable: .mergeable}}'"
             try:
                 output = self.toolbox.run_shell(cmd)
-                # Parse the JSON output from the command string which might contain extra text if run_shell is verbose
-                # But run_shell returns stdout+stderr. We need to be careful.
-                # Let's assume the JSON is the only thing or we can grep it.
-                # Actually, run_shell captures output.
-                
-                # Clean up if there's logging noise? agent logging goes to stderr/file.
-                
-                # Check for "Command failed"
                 if "Command failed" in output:
                     logger.warning("⚠️ Failed to check PR status (API error?)")
                     continue
 
-                # The output might be plain JSON.
                 status_data = json.loads(output.strip())
-                
                 state = status_data.get("state")
                 if state == "MERGED":
                     logger.info("🎉 PR Merged! Stopping monitor.")
                     ci_passed = True
                     break
                 
-                # Check Checks
                 checks = status_data.get("checks", [])
                 if not checks:
                     logger.info("⏳ No checks reported yet...")
                     continue
-                
-                # Aggregate status
-                # GitHub returns a complex structure. Simplified check:
-                # We can also check `gh run list --branch {branch}` usually easier for "Any Failure"
-                
             except Exception as e:
                 logger.warning(f"⚠️ Error parsing PR status: {e}")
                 
-            # Alternative: Check Runs directly which is more reliable for "Did it fail?"
+            # Check Runs directly
             run_cmd = f"gh run list --branch {branch} --limit 1 --json status,conclusion,databaseId --jq '.[0]'"
             run_out = self.toolbox.run_shell(run_cmd)
             if "Command failed" not in run_out and run_out.strip() != "null":
@@ -1059,21 +1454,24 @@ class NightShiftAgent:
                         if conclusion == "success":
                             logger.info("🎉 CI Checks Passed!")
                             ci_passed = True
-                            # Auto-merge?
-                            # self.toolbox.run_shell(f"gh pr merge {branch} --auto --squash")
                             break
+                        elif conclusion == "cancelled":
+                            logger.info("ℹ️ Run was cancelled (likely superseded by newer commit). Waiting for latest run...")
+                            continue
                         elif conclusion in ["failure", "timed_out"]:
-                            logger.error(f"❌ CI Failed (Run {run_id}). Initiating Auto-Fix...")
+                            if fix_attempts >= MAX_CI_FIX_ATTEMPTS:
+                                logger.error(f"❌ Max CI fix attempts ({MAX_CI_FIX_ATTEMPTS}) reached. Stopping monitor.")
+                                break
+                            fix_attempts += 1
+                            logger.error(f"❌ CI Failed (Run {run_id}, attempt {fix_attempts}/{MAX_CI_FIX_ATTEMPTS}). Initiating Auto-Fix...")
                             if self.attempt_fix(branch, run_id):
                                 logger.info("✅ Auto-Fix applied and pushed. Resetting monitor...")
-                                # Reset loop or continue? 
-                                # We should typically break inner loop or reset counter, 
-                                # but for now let's just use the remaining polls.
                                 continue 
                             else:
                                 logger.error("❌ Auto-Fix failed. Stopping.")
                                 break
-                except: pass
+                except Exception as e:
+                    logger.warning(f"Error parsing CI run status: {e}")
 
         if ci_passed:
             logger.info("✅ Monitoring complete: CI Passed.")
@@ -1362,21 +1760,24 @@ CRITICAL - DO NOT HALLUCINATE:
                 build_output = self.toolbox.verify_build()
                 messages.append({"role": "user", "content": f"AUTO-VERIFICATION OUTPUT:\n{build_output}"})
                 
-            # Build Failure Logic
-            if tool_run and self.build_state.build_attempted and not self.build_state.build_passed:
-                consecutive_failures += 1
-                if consecutive_failures >= 5:
-                    # Only revert if we actually have a checkpoint to revert to
-                    if self.build_state.last_successful_files:
-                        logger.warning(f"⚠️ 5 Consecutive failures. Reverting {len(self.build_state.last_successful_files)} files to checkpoint...")
-                        for p, c in self.build_state.last_successful_files.items():
-                            self.toolbox.write_file(path=p, content=c)
-                            logger.info(f"   ↩️ Reverted: {os.path.basename(p)}")
-                        messages.append({"role": "user", "content": "SYSTEM: Build failed 5 times. Files reverted to last working checkpoint. Try a simpler approach."})
-                    else:
-                        logger.warning("⚠️ 5 Consecutive failures but no checkpoint exists. Notifying model to try simpler approach.")
-                        messages.append({"role": "user", "content": "SYSTEM: Build has failed 5 consecutive times with no working checkpoint to revert to. Please try a simpler, more incremental approach."})
+            # Build Failure Logic - only increment on actual build attempts
+            if tool_run and self.build_state.build_attempted:
+                if not self.build_state.build_passed:
+                    consecutive_failures += 1
+                    if consecutive_failures >= 5:
+                        if self.build_state.last_successful_files:
+                            logger.warning(f"⚠️ 5 Consecutive failures. Reverting {len(self.build_state.last_successful_files)} files to checkpoint...")
+                            for p, c in self.build_state.last_successful_files.items():
+                                self.toolbox.write_file(path=p, content=c)
+                                logger.info(f"   ↩️ Reverted: {os.path.basename(p)}")
+                            messages.append({"role": "user", "content": "SYSTEM: Build failed 5 times. Files reverted to last working checkpoint. Try a simpler approach."})
+                        else:
+                            logger.warning("⚠️ 5 Consecutive failures but no checkpoint exists. Notifying model to try simpler approach.")
+                            messages.append({"role": "user", "content": "SYSTEM: Build has failed 5 consecutive times with no working checkpoint to revert to. Please try a simpler, more incremental approach."})
+                        consecutive_failures = 0
+                else:
                     consecutive_failures = 0
+                self.build_state.build_attempted = False
             
             # Check Success (Build Passed + User Task satisfied implies we should commit)
             if self.build_state.build_passed and self.build_state.is_verified():
@@ -1388,9 +1789,152 @@ CRITICAL - DO NOT HALLUCINATE:
         
         return False
 
+    def execute_card(self, card: dict, run_id: str, heartbeat: LeaseHeartbeatWorker) -> tuple:
+        """Execute a single claimed card. Returns (outcome, gate_results, artifacts, error_msg)."""
+        card_id = card.get("id", "unknown")
+        kind = card.get("kind", "software")
+        repo_name = card.get("repo")
+        gate_ids = card.get("gate_ids") or []
 
-    def run(self):
-        logger.info(f"🚀 Starting Agent in {self.project_dir}")
+        self.current_run_id = run_id
+        self.current_card = card
+        self.toolbox.current_card_id = card_id
+        self.toolbox.target_gates = list(gate_ids)
+
+        # Set up logging keyed to this run_id (observability join key)
+        self._setup_logging(run_id=run_id)
+        self.llm.reset_session_tokens()
+
+        orig_cwd = Path.cwd()
+        target_dir = self.project_dir
+
+        if kind == "software" and repo_name:
+            potential_paths = [
+                Path.home() / "git" / repo_name,
+                self.project_dir / repo_name,
+                self.project_dir
+            ]
+            for p in potential_paths:
+                if p.exists() and (p / ".git").exists():
+                    target_dir = p
+                    break
+
+        os.chdir(target_dir)
+        self.toolbox.project_dir = target_dir
+        logger.info(f"📂 Switched to target directory: {target_dir}")
+
+        branch = None
+        artifacts = None
+
+        try:
+            if kind == "software" and (target_dir / ".git").exists():
+                self.configure_git()
+                branch = f"{BRANCH_PREFIX}/{card_id}"
+                self.run_cmd_quiet(f"git checkout -b {branch} 2>/dev/null || git checkout {branch}")
+                logger.info(f"🌿 Working on branch: {branch}")
+
+            task_intro = f"CARD [{card_id}] ({kind.upper()}): {card.get('title')}\nGOAL: {card.get('goal')}"
+
+            arch_output = self.toolbox.run_shell("tree -L 2 -I 'build|.*' 2>/dev/null || find . -maxdepth 2 -type d ! -path '*/.*' ! -path './build*' 2>/dev/null | head -50")
+            arch_doc = target_dir / "docs" / "ARCHITECTURE.md"
+            if arch_doc.exists():
+                try:
+                    arch_output = f"=== Directory Structure ===\n{arch_output}\n\n=== ARCHITECTURE.md ===\n{arch_doc.read_text()}"
+                except Exception as e:
+                    logger.warning(f"Failed to read ARCHITECTURE.md: {e}")
+
+            files = self.toolbox.list_files()
+            task_success = self.process_task(task_intro, arch_output, files)
+
+            if heartbeat.abandoned:
+                logger.warning(f"🛑 Run {run_id} was abandoned by admin.")
+                return "abandoned", self.toolbox.last_gate_results, None, "Card abandoned by admin during execution"
+
+            if task_success:
+                commit_ok = self.commit_changes(f"[{card_id}] {card.get('title')}")
+                commit_sha = self.run_cmd_quiet("git rev-parse HEAD").stdout.strip() if commit_ok else None
+
+                if branch and commit_ok:
+                    push_res = self.toolbox.run_shell(f"git push -u origin {branch}")
+                    artifacts = {"branch": branch, "commit_sha": commit_sha}
+
+                return "succeeded", self.toolbox.last_gate_results, artifacts, None
+            else:
+                return "failed", self.toolbox.last_gate_results, None, "Verification failed or max iterations reached"
+
+        finally:
+            os.chdir(orig_cwd)
+            self.toolbox.project_dir = orig_cwd
+
+    def run_swarm(self, lane: str = DEFAULT_LANE, max_runs: int = None, poll_interval_base: float = CONTROL_PLANE_POLL_INTERVAL_BASE):
+        """Swarm worker mode: poll controlPlaneMcp for ready cards in lane, execute with heartbeats, report tokens."""
+        logger.info(f"🐝 Night Shift starting in Swarm Worker mode (lane: {lane})...")
+        runs_count = 0
+
+        while True:
+            if max_runs is not None and runs_count >= max_runs:
+                logger.info(f"Reached max runs limit ({max_runs}). Exiting swarm loop.")
+                break
+
+            # Add jitter between 30s and 60s
+            jitter = random.uniform(-15.0, 15.0)
+            delay = max(10.0, poll_interval_base + jitter)
+
+            resources = self.detect_resources()
+            try:
+                claim_result = self.control_plane.claim(lane=lane, resources=resources)
+            except Exception as e:
+                logger.error(f"❌ Error polling control plane: {e}")
+                time.sleep(delay)
+                continue
+
+            if not claim_result or not claim_result.get("card"):
+                logger.info(f"😴 No cards ready in lane '{lane}'. Sleeping {delay:.1f}s...")
+                time.sleep(delay)
+                continue
+
+            card = claim_result["card"]
+            run_id = claim_result["run_id"]
+            logger.info(f"🎯 Claimed card {card.get('id')}: '{card.get('title')}' (Run {run_id})")
+
+            self.apply_usage_policy()
+
+            heartbeat = LeaseHeartbeatWorker(self.control_plane, run_id)
+            heartbeat.start()
+
+            outcome = "failed"
+            gate_results = []
+            artifacts = None
+            error_msg = None
+
+            try:
+                outcome, gate_results, artifacts, error_msg = self.execute_card(card, run_id, heartbeat)
+            except Exception as e:
+                logger.error(f"❌ Unhandled error executing card {card.get('id')}: {e}")
+                error_msg = str(e)
+                outcome = "failed"
+            finally:
+                heartbeat.stop()
+
+            tokens = self.llm.get_session_tokens()
+            try:
+                logger.info(f"🏁 Releasing card {card.get('id')} (Run {run_id}) outcome={outcome}, tokens={tokens}")
+                self.control_plane.release(
+                    run_id=run_id,
+                    outcome=outcome,
+                    gates=gate_results,
+                    artifacts=artifacts,
+                    tokens=tokens,
+                    error=error_msg
+                )
+            except Exception as e:
+                logger.error(f"❌ Failed to release card {card.get('id')}: {e}")
+
+            runs_count += 1
+
+    def run_file(self):
+        """Legacy mode: process tasks from local tasks.txt."""
+        logger.info(f"🚀 Starting Agent in file mode ({self.project_dir})")
         self.configure_git()
         
         tasks_file = self.project_dir / "tasks.txt"
@@ -1398,70 +1942,48 @@ CRITICAL - DO NOT HALLUCINATE:
             return
             
         with open(tasks_file) as f: all_tasks = [l.strip() for l in f if l.strip()]
-        
-        if not all_tasks: return  # Truly empty file
+        if not all_tasks: return
 
         branch = self.create_branch()
-        
-        # Get project architecture - try tree, fall back to find
         arch_output = self.toolbox.run_shell("tree -L 2 -I 'build|.*' 2>/dev/null || find . -maxdepth 2 -type d ! -path '*/.*' ! -path './build*' 2>/dev/null | head -50")
-        
-        # Also read ARCHITECTURE.md if it exists for richer context
         arch_doc = self.project_dir / "docs" / "ARCHITECTURE.md"
         if arch_doc.exists():
             try:
-                arch_content = arch_doc.read_text()
-                arch_output = f"=== Directory Structure ===\n{arch_output}\n\n=== ARCHITECTURE.md ===\n{arch_content}"
+                arch_output = f"=== Directory Structure ===\n{arch_output}\n\n=== ARCHITECTURE.md ===\n{arch_doc.read_text()}"
             except Exception as e:
                 logger.warning(f"Failed to read ARCHITECTURE.md: {e}")
         
         files = self.toolbox.list_files()
-
         completed_tasks = []
         
-        # First pass: check for already completed tasks to include in PR
         for task in all_tasks:
             if task.startswith("[x]"):
-                 clean_task = task.replace("[x]", "").replace("[!]", "").strip()
-                 completed_tasks.append(clean_task)
+                 completed_tasks.append(task.replace("[x]", "").replace("[!]", "").strip())
 
         for task in all_tasks:
-            if task.startswith("[x]"): continue # Skip already done
+            if task.startswith("[x]"): continue
 
             logger.info(f"▶️ Processing: {task}")
-            # Clean task string handling
             clean_task = task.replace("[ ]", "").replace("[!]", "").strip()
             if self.process_task(clean_task, arch_output, files):
-                # Mark task complete in tasks.txt BEFORE commit (so it's included)
                 try:
-                    tasks_file = self.project_dir / "tasks.txt"
                     if os.path.exists(tasks_file):
-                        # Re-read to ensure we don't overwrite other parallel changes
                         current_content = open(tasks_file).read()
-                        # Replace the specific line
-                        # We use the original task string to find it
-                        new_content = current_content.replace(task, f"[x] {clean_task}")
+                        new_content = current_content.replace(task, f"[x] {clean_task}", 1)
                         open(tasks_file, "w").write(new_content)
                         logger.info(f"✅ Marked task complete in tasks.txt: {clean_task}")
                     else:
-                        logger.warning(f"⚠️ tasks.txt not found. Creating new one with completed task.")
                         with open(tasks_file, "w") as f:
                             f.write(f"[x] {clean_task}\n")
                 except Exception as e:
                     logger.error(f"❌ Failed to update tasks.txt: {e}")
 
-                # Commit this task's changes (including tasks.txt update)
-                # We try to commit. If it returns True (committed) OR False (no changes but task done), we record success.
-                # Actually, if build passed, we consider it done.
                 self.commit_changes(clean_task)
                 completed_tasks.append(clean_task)
 
-        # Check for any uncommitted changes (like .gitignore or tasks.txt from previous runs)
-        # This handles the case where a task was marked [x] but the commit failed/agent crashed
         if self.commit_changes("Update task status"):
              logger.info("✅ Committed pending task status updates")
 
-        # Push and create PR if we have ANY completed tasks (new or old)
         if completed_tasks:
             pr_created = self.push_and_create_pr(completed_tasks, branch)
             if pr_created:
@@ -1469,10 +1991,21 @@ CRITICAL - DO NOT HALLUCINATE:
             else:
                 logger.info("✅ No PR to monitor. Agent complete.")
 
+    def run(self):
+        """Default run entrypoint: executes in swarm worker mode."""
+        self.run_swarm()
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--project-dir', default='.')
+    parser = argparse.ArgumentParser(description="Night Shift Agent - Swarm Worker")
+    parser.add_argument('--project-dir', default='.', help="Working project directory")
+    parser.add_argument('--mode', choices=['swarm', 'file'], default='swarm', help="Execution mode ('swarm' or 'file')")
+    parser.add_argument('--lane', default=DEFAULT_LANE, help="Control plane lane (default: local)")
+    parser.add_argument('--max-runs', type=int, default=None, help="Max cards to process before exiting")
+    parser.add_argument('--poll-interval', type=float, default=CONTROL_PLANE_POLL_INTERVAL_BASE, help="Base polling delay in seconds")
     args = parser.parse_args()
     
     agent = NightShiftAgent(args.project_dir)
-    agent.run()
+    if args.mode == "file":
+        agent.run_file()
+    else:
+        agent.run_swarm(lane=args.lane, max_runs=args.max_runs, poll_interval_base=args.poll_interval)
