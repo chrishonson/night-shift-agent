@@ -539,6 +539,13 @@ class ProviderManager:
         self.providers: List[LLMProvider] = []
         self.current_index = 0  # Persist which provider is working
         self.session_tokens = {"input": 0, "output": 0}
+        # FORCE_PROVIDER=ollama pins the chain to local for the whole process.
+        # The usage loop may not lift that pin: an operator saying "local only"
+        # outranks an allowance saying "there is subscription left".
+        self.pinned_local = os.getenv("FORCE_PROVIDER", "").lower() == "ollama"
+        self.local_only = self.pinned_local
+        if self.pinned_local:
+            logger.info("🔌 FORCE_PROVIDER=ollama: pinned to local inference, usage policy will not override.")
         self._init_providers()
 
     def reset_session_tokens(self):
@@ -546,28 +553,34 @@ class ProviderManager:
 
     def get_session_tokens(self) -> dict:
         return dict(self.session_tokens)
-        
+
     def _init_providers(self):
         # Determine order based on env preference
         gemini_model = os.getenv("PREFERRED_AGENT_MODEL", DEFAULT_MODEL_GEMINI)
         ollama_model = os.getenv("OLLAMA_MODEL", DEFAULT_MODEL_OLLAMA)
-        
-        # Define all providers
-        ollama_p = OllamaProvider(model=ollama_model) # Primary: Local & Free
-        gemini_p = GeminiCLIProvider(model=gemini_model)
-        claude_p = ClaudeCLIProvider() # Default claude model
-        openrouter_p = OpenRouterAPIProvider() # Fallback to openrouter
-        
-        # User preferred order: Gemini -> Claude -> OpenRouter -> Ollama
-        force_provider = os.getenv("FORCE_PROVIDER", "").lower()
 
-        if force_provider == "ollama":
-            self.providers = [ollama_p]
-            logger.info(f"🔌 FORCE_PROVIDER=ollama: Limited to Ollama only.")
+        if self.local_only:
+            self.providers = [OllamaProvider(model=ollama_model)]
         else:
-            self.providers = [gemini_p, claude_p, openrouter_p, ollama_p]
-            
+            # Subscription capacity first, local last: paid allowance left
+            # unspent when the usage window closes is lost.
+            self.providers = [
+                GeminiCLIProvider(model=gemini_model),
+                ClaudeCLIProvider(),
+                OpenRouterAPIProvider(),
+                OllamaProvider(model=ollama_model)
+            ]
+
+        self.current_index = 0
         logger.info(f"🔌 Provider Chain: {[p.name for p in self.providers]}")
+
+    def set_local_only(self, local_only: bool) -> bool:
+        """Move between the subscription chain and local-only. Returns True if the chain changed."""
+        if self.pinned_local or local_only == self.local_only:
+            return False
+        self.local_only = local_only
+        self._init_providers()
+        return True
 
     def ask(self, prompt: str) -> Optional[str]:
         # Start from the last working provider, not always from 0
@@ -1115,6 +1128,41 @@ class ControlPlaneClient:
     def snapshot(self) -> dict:
         return self.call_tool("board_snapshot", {})
 
+    def usage_report(self) -> dict:
+        return self.call_tool("usage_report", {})
+
+
+def decide_inference_mode(self_usage: Optional[dict]) -> tuple:
+    """Choose the inference tier from a usage_report `self` entry.
+
+    Returns (local_only, reason). The control plane owns the policy, so this
+    reads its verdict rather than recomputing it. Three cases, per usagePolicy.ts:
+
+    - allowance is null: undeclared, which means unmetered. Keep spending. This
+      is not "zero" and it is never exhausted.
+    - exhausted: the declared allowance is used up in the open window. Fall back
+      to local inference until the window rolls, which it does lazily.
+    - otherwise: subscription capacity remains, and capacity left unspent when
+      the window closes is lost. Keep spending.
+    """
+    if not self_usage:
+        return False, "no usage entry returned; assuming subscription capacity remains"
+
+    allowance = self_usage.get("allowance")
+    total = self_usage.get("total") or 0
+
+    if allowance is None:
+        return False, (
+            f"identity '{self_usage.get('identity_id', '?')}' declares no allowance, so it is "
+            f"unmetered and can never exhaust. Spent {total} tokens this window. "
+            "The local-inference fallback is wired but inert until an allowance is declared."
+        )
+
+    if self_usage.get("exhausted"):
+        return True, f"allowance exhausted ({total}/{allowance} tokens this window). Falling back to local inference."
+
+    return False, f"{self_usage.get('remaining')} of {allowance} tokens left this window. Keep spending the subscription."
+
 
 class LeaseHeartbeatWorker:
     """Background daemon thread maintaining the lease on an in-progress card."""
@@ -1218,6 +1266,35 @@ class NightShiftAgent:
         except Exception as e:
             logger.debug(f"Resource detection (adb): {e}")
         return resources
+
+    def apply_usage_policy(self) -> bool:
+        """Pick the inference tier for the card about to run. Returns True when local-only.
+
+        Called once per claimed card, not per LLM request. A card is the unit
+        that reports tokens on release, so it is the smallest interval at which
+        the control plane's view of the window can actually have changed; and
+        the window rolls on its own, so a decision taken before a long card may
+        be stale by the end of it, but re-deciding mid-card would swap the
+        provider under a running conversation.
+
+        A failed report leaves the current chain alone. Refusing to spend
+        subscription capacity because the bookkeeping call failed would be the
+        opposite of maxing it.
+        """
+        try:
+            report = self.control_plane.usage_report()
+        except Exception as e:
+            logger.warning(f"⚠️ usage_report failed ({e}). Staying on the current provider chain.")
+            return self.llm.local_only
+
+        local_only, reason = decide_inference_mode((report or {}).get("self"))
+        logger.info(f"📊 Usage window: {reason}")
+
+        if self.llm.set_local_only(local_only):
+            tier = "local inference (Ollama)" if local_only else "the subscription chain"
+            logger.info(f"🔀 Switched to {tier}.")
+
+        return self.llm.local_only
 
     def run_cmd_quiet(self, cmd):
         env = os.environ.copy()
@@ -1819,6 +1896,8 @@ CRITICAL - DO NOT HALLUCINATE:
             card = claim_result["card"]
             run_id = claim_result["run_id"]
             logger.info(f"🎯 Claimed card {card.get('id')}: '{card.get('title')}' (Run {run_id})")
+
+            self.apply_usage_policy()
 
             heartbeat = LeaseHeartbeatWorker(self.control_plane, run_id)
             heartbeat.start()
