@@ -27,3 +27,6 @@ Thumbs.db
 
 # Test outputs
 *.log
+
+# Agent scratch output
+.artifacts/
