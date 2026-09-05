@@ -50,10 +50,25 @@ CONTROL_PLANE_HEARTBEAT_INTERVAL = 60.0  # seconds
 # - gemini-3-flash-preview
 # Aliases: auto, auto-gemini-2.5, auto-gemini-3, pro, flash, flash-lite
 # Embedding: gemini-embedding-001
-DEFAULT_PROVIDER = "gemini"
+# How the agent reaches a model. This is the axis that decides auth, cost and
+# failure mode, so every provider declares one.
+#   headless  a coding CLI driven in print mode, paid by subscription
+#   local     inference on this machine, paid in electricity
+#   cloud     an HTTP API billed per token. Built, deliberately not wired.
+KIND_HEADLESS = "headless"
+KIND_LOCAL = "local"
+KIND_CLOUD = "cloud"
+
+# The headless providers the default chain walks, in order. Every headless
+# provider below is selectable by name via FORCE_PROVIDER, but only these are
+# reached without being asked for.
+HEADLESS_ORDER = ["antigravity"]
 DEFAULT_MODEL_GEMINI = "gemini-3-flash-preview"
 DEFAULT_MODEL_OPENROUTER = "google/gemini-2.0-flash-exp:free"
-DEFAULT_MODEL_CLAUDE = "claude-3-5-sonnet-20241022" 
+DEFAULT_MODEL_CLAUDE = "claude-sonnet-5"
+# -low could not complete a Compose UI card: it read files for 80 iterations
+# without writing the screen. -high completes the same card.
+DEFAULT_MODEL_ANTIGRAVITY = "gemini-3.8-flash-high"
 DEFAULT_MODEL_OLLAMA = "deepseek-r1:32b"
 OLLAMA_BASE_URL = "http://localhost:11434/api/generate" 
 
@@ -225,6 +240,8 @@ from typing import List, Optional
 
 class LLMProvider(ABC):
     """Abstract base class for LLM providers (CLI or API)."""
+
+    kind: str = KIND_HEADLESS
     
     @abstractmethod
     def ask(self, prompt_or_messages) -> Optional[str]:
@@ -260,7 +277,104 @@ class LLMProvider(ABC):
             return '\n'.join(lines).strip()
         return text
 
+class AntigravityCLIProvider(LLMProvider):
+    """Google's Antigravity CLI (`agy`) in headless print mode.
+
+    Two quirks drive the shape of this class:
+
+    `--print` takes the prompt as its own value, so it must be attached to the
+    flag. Piping on stdin makes agy print its help instead of answering.
+
+    Headless mode auto-denies any tool the model reaches for and then returns
+    no answer at all. That is what we want, since this agent drives its own
+    tools, but it means an attempted tool call yields empty output rather than
+    an error. That case is detected and reported as a failed attempt so the
+    chain falls through to local rather than looping on nothing.
+    """
+
+    kind = KIND_HEADLESS
+
+    # agy prints this to stdout when headless permission denial ate the turn.
+    _TOOL_DENIED_MARKER = "no output produced"
+
+    def __init__(self, model=DEFAULT_MODEL_ANTIGRAVITY):
+        super().__init__()
+        self.model = model
+
+    @property
+    def name(self): return f"Antigravity CLI ({self.model})"
+
+    def ask(self, prompt_or_messages) -> Optional[str]:
+        if isinstance(prompt_or_messages, list):
+            prompt = self.messages_to_string(prompt_or_messages)
+        else:
+            prompt = prompt_or_messages
+
+        prompt_logger.debug(
+            f"{'='*80}\n>>> PROMPT TO {self.name}\n{'='*80}\n{prompt}\n{'='*80}\n"
+        )
+
+        for attempt in range(MAX_RETRIES):
+            try:
+                # No shell, so the prompt needs no quoting. Prompts run ~40KB
+                # against a 1MB ARG_MAX, which is ample headroom.
+                result = subprocess.run(
+                    ["agy", f"--model={self.model}", f"--print={prompt}"],
+                    capture_output=True, text=True, timeout=300, stdin=subprocess.DEVNULL
+                )
+
+                self._log_raw_response(attempt, result)
+                self._check_quota(result.stdout + result.stderr)
+
+                if result.returncode != 0:
+                    logger.warning(f"⚠️ {self.name} Error ({attempt+1}/{MAX_RETRIES}): {result.stderr}")
+                    self._backoff(attempt)
+                    continue
+
+                out = result.stdout.strip()
+                if self._TOOL_DENIED_MARKER in out.lower():
+                    logger.warning(
+                        f"⚠️ {self.name} tried to call a tool, which headless mode denied, "
+                        f"so it returned no answer ({attempt+1}/{MAX_RETRIES})."
+                    )
+                    self._backoff(attempt)
+                    continue
+
+                if out:
+                    return self.strip_markdown_code_blocks(out)
+
+                logger.warning(f"⚠️ {self.name} returned nothing ({attempt+1}/{MAX_RETRIES}).")
+                self._backoff(attempt)
+
+            except QuotaExceededError:
+                raise
+            except Exception as e:
+                logger.warning(f"⚠️ {self.name} Exception ({attempt+1}/{MAX_RETRIES}): {e}")
+                self._backoff(attempt)
+        return None
+
+    def _log_raw_response(self, attempt, result):
+        prompt_logger.debug(
+            f"{'='*80}\n<<< RAW RESPONSE ({attempt+1}) RC:{result.returncode}\n{'='*80}\n"
+            f"STDOUT:\n{result.stdout}\n{'~'*40}\nSTDERR:\n{result.stderr}\n{'='*80}\n"
+        )
+
+    def _check_quota(self, combined_output):
+        lower = combined_output.lower()
+        if any(x in lower for x in ["quota exceeded", "resource exhausted", "rate limit"]):
+            logger.error(f"🚨 {self.name} Quota Exceeded!")
+            raise QuotaExceededError(f"{self.name} Quota Exceeded")
+        if "429" in lower and ("error" in lower or "too many" in lower):
+            logger.error(f"🚨 {self.name} Rate Limited (429)!")
+            raise QuotaExceededError(f"{self.name} Rate Limited")
+
+    def _backoff(self, attempt):
+        if attempt < MAX_RETRIES - 1:
+            time.sleep(RETRY_BASE_DELAY * (2 ** attempt))
+
 class GeminiCLIProvider(LLMProvider):
+    kind = KIND_HEADLESS
+
     def __init__(self, model=DEFAULT_MODEL_GEMINI):
         super().__init__()
         self.model = model
@@ -339,6 +453,8 @@ class GeminiCLIProvider(LLMProvider):
             time.sleep(RETRY_BASE_DELAY * (2 ** attempt))
 
 class ClaudeCLIProvider(LLMProvider):
+    kind = KIND_HEADLESS
+
     def __init__(self, model=""):
         super().__init__()
         self.model = model
@@ -410,6 +526,8 @@ class ClaudeCLIProvider(LLMProvider):
             time.sleep(RETRY_BASE_DELAY * (2 ** attempt))
 
 class OllamaProvider(LLMProvider):
+    kind = KIND_LOCAL
+
     """Ollama provider with KV cache optimization.
     
     Ollama's /api/chat endpoint automatically caches previous tokens in the KV cache
@@ -492,6 +610,8 @@ class OllamaProvider(LLMProvider):
 
 
 class OpenRouterAPIProvider(LLMProvider):
+    kind = KIND_CLOUD
+
     def __init__(self):
         super().__init__()
         
@@ -591,28 +711,37 @@ class ProviderManager:
         self._init_providers()
 
     def _init_providers(self):
-        # Determine order based on env preference
-        gemini_model = os.getenv("PREFERRED_AGENT_MODEL", DEFAULT_MODEL_GEMINI)
-        ollama_model = os.getenv("OLLAMA_MODEL", DEFAULT_MODEL_OLLAMA)
+        """Build the chain: headless first, local as the fallback under it.
 
-        if self.force_provider == "claude":
-            self.providers = [ClaudeCLIProvider(), OllamaProvider(model=ollama_model)]
-        elif self.force_provider == "ollama":
-            self.providers = [OllamaProvider(model=ollama_model)]
-        elif self.force_provider == "gemini":
-            self.providers = [GeminiCLIProvider(model=gemini_model)]
-        elif self.force_provider == "openrouter":
-            self.providers = [OpenRouterAPIProvider()]
+        Cloud is not wired. OpenRouterAPIProvider still exists but nothing
+        selects it, so no run can bill per token without a code change.
+        """
+        gemini_model = os.getenv("GEMINI_MODEL", os.getenv("PREFERRED_AGENT_MODEL", DEFAULT_MODEL_GEMINI))
+        ollama_model = os.getenv("OLLAMA_MODEL", DEFAULT_MODEL_OLLAMA)
+        claude_model = os.getenv("CLAUDE_MODEL", DEFAULT_MODEL_CLAUDE)
+        antigravity_model = os.getenv("ANTIGRAVITY_MODEL", DEFAULT_MODEL_ANTIGRAVITY)
+
+        headless = {
+            "antigravity": lambda: AntigravityCLIProvider(model=antigravity_model),
+            "claude": lambda: ClaudeCLIProvider(model=claude_model),
+            "gemini": lambda: GeminiCLIProvider(model=gemini_model),
+        }
+        local = OllamaProvider(model=ollama_model)
+
+        if self.force_provider == "ollama":
+            self.providers = [local]
+        elif self.force_provider in headless:
+            self.providers = [headless[self.force_provider](), local]
         else:
-            self.providers = [
-                ClaudeCLIProvider(),
-                GeminiCLIProvider(model=gemini_model),
-                OpenRouterAPIProvider(),
-                OllamaProvider(model=ollama_model)
-            ]
+            if self.force_provider:
+                logger.warning(
+                    f"⚠️ FORCE_PROVIDER={self.force_provider} is not a wired provider. "
+                    f"Wired: {', '.join(list(headless) + ['ollama'])}. Falling back to the default chain."
+                )
+            self.providers = [headless[n]() for n in HEADLESS_ORDER] + [local]
 
         self.current_index = 0
-        logger.info(f"🔌 Provider Chain: {[p.name for p in self.providers]}")
+        logger.info(f"🔌 Provider Chain: {[f'{p.name} [{p.kind}]' for p in self.providers]}")
 
     def ask(self, prompt: str) -> Optional[str]:
         # Start from the last working provider, not always from 0
