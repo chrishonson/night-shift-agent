@@ -19,6 +19,7 @@ import urllib.request
 import urllib.error
 import logging
 import argparse
+import shlex
 import difflib
 import random
 import threading
@@ -71,6 +72,73 @@ PROTECTED_FILES = {
     "build.gradle.kts", "settings.gradle.kts", "gradle.properties", 
     "libs.versions.toml", "gradle-wrapper.properties", "tasks.txt"
 }
+
+# Branches the agent may never push to. It holds a bot token with write access
+# and run_shell executes whatever the model emits, so this is the enforcement
+# point wherever server-side branch protection is unavailable (a private repo
+# on a free GitHub plan cannot have it at all).
+PROTECTED_BRANCHES = {"main", "master"}
+
+_SHELL_SEPARATORS = re.compile(r"&&|\|\||;|\n|(?<!\|)\|(?!\|)")
+
+
+def _push_destination(refspec: str) -> str:
+    """The branch a refspec writes to. `HEAD:main` and `+main` both mean main."""
+    dest = refspec.split(":")[-1].lstrip("+")
+    if dest.startswith("refs/heads/"):
+        dest = dest[len("refs/heads/"):]
+    return dest
+
+
+def blocked_push_target(command: str, current_branch=None):
+    """Return the protected branch this command would push to, else None.
+
+    A bare `git push` takes its destination from the branch that is checked
+    out, so the guard has to ask rather than read it off the command line.
+    """
+    for segment in _SHELL_SEPARATORS.split(command):
+        try:
+            tokens = shlex.split(segment)
+        except ValueError:
+            tokens = segment.split()
+        # Drop leading VAR=value assignments, then `git` and any global options
+        # such as `git -C <dir> push`.
+        while tokens and "=" in tokens[0] and not tokens[0].startswith("-"):
+            tokens = tokens[1:]
+        if not tokens or os.path.basename(tokens[0]) != "git":
+            continue
+        rest = tokens[1:]
+        while rest and rest[0].startswith("-"):
+            rest = rest[2:] if rest[0] in ("-C", "-c") else rest[1:]
+        if not rest or rest[0] != "push":
+            continue
+
+        args = rest[1:]
+        if any(a in ("--all", "--mirror") for a in args):
+            return sorted(PROTECTED_BRANCHES)[0]
+
+        positionals = []
+        skip_next = False
+        for a in args:
+            if skip_next:
+                skip_next = False
+                continue
+            if a.startswith("-"):
+                skip_next = a in ("--repo", "-o", "--push-option", "--exec", "--receive-pack")
+                continue
+            positionals.append(a)
+
+        refspecs = positionals[1:]
+        if not refspecs:
+            branch = current_branch() if current_branch else None
+            if branch in PROTECTED_BRANCHES:
+                return branch
+            continue
+        for refspec in refspecs:
+            dest = _push_destination(refspec)
+            if dest in PROTECTED_BRANCHES:
+                return dest
+    return None
 
 CI_POLL_INTERVAL = 60  # Seconds
 MAX_CI_WAIT_POLLS = 30 # 30 * 60s = 30 minutes
@@ -660,7 +728,22 @@ class Toolbox:
             return f"Successfully wrote to {target}"
         except Exception as e: return f"Error writing {target}: {e}"
 
+    def _current_branch(self) -> str:
+        try:
+            r = subprocess.run(["git", "branch", "--show-current"], cwd=self.project_dir,
+                               capture_output=True, text=True, timeout=10,
+                               stdin=subprocess.DEVNULL)
+            return r.stdout.strip()
+        except Exception:
+            return ""
+
     def run_shell(self, command: str) -> str:
+        protected = blocked_push_target(command, current_branch=self._current_branch)
+        if protected:
+            logger.warning(f"\U0001F6E1\uFE0F Refused a push to protected branch '{protected}'")
+            return (f"ERROR: '{protected}' is a protected branch and cannot be pushed to. "
+                    f"Push your card branch instead and open a pull request.")
+
         allowed, reason = self.rate_limiter.should_allow(command)
         if not allowed: return f"Error: {reason}"
         
