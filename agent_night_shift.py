@@ -69,6 +69,9 @@ DEFAULT_MODEL_CLAUDE = "claude-sonnet-5"
 # -low could not complete a Compose UI card: it read files for 80 iterations
 # without writing the screen. -high completes the same card.
 DEFAULT_MODEL_ANTIGRAVITY = "gemini-3.8-flash-high"
+# Seconds agy may spend on one print. Large repos produce large prompts and
+# 300s was not enough: three calls on the control-plane repo hit it.
+ANTIGRAVITY_PRINT_TIMEOUT_S = 900
 DEFAULT_MODEL_OLLAMA = "deepseek-r1:32b"
 OLLAMA_BASE_URL = "http://localhost:11434/api/generate" 
 
@@ -318,9 +321,17 @@ class AntigravityCLIProvider(LLMProvider):
             try:
                 # No shell, so the prompt needs no quoting. Prompts run ~40KB
                 # against a 1MB ARG_MAX, which is ample headroom.
+                # agy's own --print-timeout defaults to 5m and our subprocess
+                # timeout was also 300s, so the two raced and a slow answer was
+                # killed here rather than returned. Give agy the shorter budget
+                # of the two so it fails in a way we can read.
                 result = subprocess.run(
-                    ["agy", f"--model={self.model}", f"--print={prompt}"],
-                    capture_output=True, text=True, timeout=300, stdin=subprocess.DEVNULL
+                    ["agy", f"--model={self.model}",
+                     f"--print-timeout={ANTIGRAVITY_PRINT_TIMEOUT_S}s",
+                     f"--print={prompt}"],
+                    capture_output=True, text=True,
+                    timeout=ANTIGRAVITY_PRINT_TIMEOUT_S + 60,
+                    stdin=subprocess.DEVNULL
                 )
 
                 self._log_raw_response(attempt, result)
