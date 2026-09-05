@@ -994,7 +994,10 @@ class Toolbox:
         run_gate_script = self.project_dir / "scripts" / "run-gate.py"
 
         if verification_file.exists() and run_gate_script.exists():
-            test_cmd = f"python3 {run_gate_script} quality"
+            # The card declares the gates it is judged by. Anything else makes
+            # every TDD loop read red no matter what the tests actually did.
+            gate_id = self.target_gates[0] if self.target_gates else "quality"
+            test_cmd = f"python3 {run_gate_script} {gate_id}"
         else:
             test_cmd = "./gradlew testDebugUnitTest"
         
