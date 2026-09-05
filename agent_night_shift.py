@@ -1755,14 +1755,14 @@ CRITICAL - DO NOT HALLUCINATE:
             os.chdir(orig_cwd)
             self.toolbox.project_dir = orig_cwd
 
-    def run_swarm(self, lane: str = DEFAULT_LANE, max_runs: int = None, poll_interval_base: float = CONTROL_PLANE_POLL_INTERVAL_BASE):
-        """Swarm worker mode: poll controlPlaneMcp for ready cards in lane, execute with heartbeats."""
-        logger.info(f"🐝 Night Shift starting in Swarm Worker mode (lane: {lane})...")
+    def run_control_plane(self, lane: str = DEFAULT_LANE, max_runs: int = None, poll_interval_base: float = CONTROL_PLANE_POLL_INTERVAL_BASE):
+        """Control-plane mode: poll controlPlaneMcp for ready cards in lane, execute with heartbeats."""
+        logger.info(f"🎛️ Night Shift starting in control-plane mode (lane: {lane})...")
         runs_count = 0
 
         while True:
             if max_runs is not None and runs_count >= max_runs:
-                logger.info(f"Reached max runs limit ({max_runs}). Exiting swarm loop.")
+                logger.info(f"Reached max runs limit ({max_runs}). Exiting control-plane loop.")
                 break
 
             # Add jitter between 30s and 60s
@@ -1877,13 +1877,13 @@ CRITICAL - DO NOT HALLUCINATE:
                 logger.info("✅ No PR to monitor. Agent complete.")
 
     def run(self):
-        """Default run entrypoint: executes in swarm worker mode."""
-        self.run_swarm()
+        """Default run entrypoint: takes work from the control plane."""
+        self.run_control_plane()
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Night Shift Agent - Swarm Worker")
+    parser = argparse.ArgumentParser(description="Night Shift Agent - Control Plane Worker")
     parser.add_argument('--project-dir', default='.', help="Working project directory")
-    parser.add_argument('--mode', choices=['swarm', 'file'], default='swarm', help="Execution mode ('swarm' or 'file')")
+    parser.add_argument('--mode', choices=['control-plane', 'file'], default='control-plane', help="Where work comes from: 'control-plane' (the board) or 'file' (local tasks.txt)")
     parser.add_argument('--lane', default=DEFAULT_LANE, help="Control plane lane (default: local)")
     parser.add_argument('--max-runs', type=int, default=None, help="Max cards to process before exiting")
     parser.add_argument('--poll-interval', type=float, default=CONTROL_PLANE_POLL_INTERVAL_BASE, help="Base polling delay in seconds")
@@ -1893,4 +1893,4 @@ if __name__ == "__main__":
     if args.mode == "file":
         agent.run_file()
     else:
-        agent.run_swarm(lane=args.lane, max_runs=args.max_runs, poll_interval_base=args.poll_interval)
+        agent.run_control_plane(lane=args.lane, max_runs=args.max_runs, poll_interval_base=args.poll_interval)

@@ -1,4 +1,4 @@
-"""Tests for the swarm worker surface: control plane transport, lease
+"""Tests for the control-plane worker surface: control plane transport, lease
 maintenance, per-card token accounting, and the usage/local-inference loop.
 
 Only two things are faked: the urllib transport underneath the JSON-RPC
@@ -344,7 +344,7 @@ def test_force_provider_pins_the_chain_to_local(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# run_swarm, on a real agent
+# run_control_plane, on a real agent
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
@@ -369,7 +369,7 @@ def wire(monkeypatch, agent):
     return install
 
 
-def test_the_swarm_releases_each_claimed_card_with_its_own_result(agent, wire):
+def test_the_worker_releases_each_claimed_card_with_its_own_result(agent, wire):
     claims = [claim_reply("c1", "r1"), claim_reply("c2", "r2")]
     stub = wire(
         card_claim=lambda args: claims.pop(0),
@@ -380,7 +380,7 @@ def test_the_swarm_releases_each_claimed_card_with_its_own_result(agent, wire):
         return "succeeded", [{"gate_id": "quality", "status": "passed", "duration_ms": 10}], None, None
 
     agent.execute_card = execute
-    agent.run_swarm(lane="local", max_runs=2)
+    agent.run_control_plane(lane="local", max_runs=2)
 
     releases = stub.args_for("card_release")
     assert [r["run_id"] for r in releases] == ["r1", "r2"]
@@ -389,7 +389,7 @@ def test_the_swarm_releases_each_claimed_card_with_its_own_result(agent, wire):
         assert release["gates"][0]["gate_id"] == "quality"
 
 
-def test_the_swarm_releases_failed_with_the_error_when_execution_raises(agent, wire):
+def test_the_worker_releases_failed_with_the_error_when_execution_raises(agent, wire):
     stub = wire(
         card_claim=claim_reply("c1", "r1"),
         card_release={},
@@ -399,14 +399,14 @@ def test_the_swarm_releases_failed_with_the_error_when_execution_raises(agent, w
         raise RuntimeError("gate runner missing")
 
     agent.execute_card = boom
-    agent.run_swarm(lane="local", max_runs=1)
+    agent.run_control_plane(lane="local", max_runs=1)
 
     released = stub.args_for("card_release")[0]
     assert released["outcome"] == "failed"
     assert "gate runner missing" in released["error"]
 
 
-def test_the_swarm_keeps_working_when_a_release_fails(agent, wire):
+def test_the_worker_keeps_working_when_a_release_fails(agent, wire):
     claims = [claim_reply("c1", "r1"), claim_reply("c2", "r2")]
     attempts = {"n": 0}
 
@@ -420,7 +420,7 @@ def test_the_swarm_keeps_working_when_a_release_fails(agent, wire):
     )
     agent.execute_card = lambda card, run_id, hb: ("succeeded", [], None, None)
 
-    agent.run_swarm(lane="local", max_runs=2)
+    agent.run_control_plane(lane="local", max_runs=2)
 
     # A lost release costs one run record, not the worker.
     assert attempts["n"] == 2
