@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "gates": [
+    {
+      "id": "nightshift_quality",
+      "placement": ["local"],
+      "commands": [
+        ".venv/bin/python -m pytest parts_tests -q"
+      ]
+    }
+  ]
+}

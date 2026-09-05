@@ -4,6 +4,19 @@
 
 Night Shift Agent is a Python-based autonomous coding agent powered by **Gemini AI** (with automatic failover to Claude, OpenRouter, and Ollama). It reads a task list, writes code, verifies builds, creates pull requests, and monitors CI—all without human intervention.
 
+
+## Repo location & verification
+
+This repo lives at `~/AndroidStudioProjects/night-shift-agent` (not under `~/git`). Cards and agents must pass `--project-dir` to that path.
+
+Verification uses the single gate executor:
+
+```bash
+scripts/run-gate.py nightshift_quality
+```
+
+Gate commands are pinned to the project interpreter at `.venv/bin/python` (see `verification.json`).
+
 ## Why Night Shift?
 
 Most AI coding agents run in the cloud or sandboxed environments. **Night Shift Agent runs locally on your machine**—because mobile development demands it.
