@@ -517,11 +517,9 @@ class ProviderManager:
     """Manages a list of providers and handles failover."""
     def __init__(self):
         self.providers: List[LLMProvider] = []
-        self.current_index = 0  # Persist which provider is working
-        # FORCE_PROVIDER=ollama pins the chain to local for the whole process.
-        self.pinned_local = os.getenv("FORCE_PROVIDER", "").lower() == "ollama"
-        if self.pinned_local:
-            logger.info("🔌 FORCE_PROVIDER=ollama: pinned to local inference.")
+        self.force_provider = os.getenv("FORCE_PROVIDER", "").lower().strip()
+        if self.force_provider:
+            logger.info(f"🔌 FORCE_PROVIDER={self.force_provider}: requested provider override.")
         self._init_providers()
 
     def _init_providers(self):
@@ -529,12 +527,18 @@ class ProviderManager:
         gemini_model = os.getenv("PREFERRED_AGENT_MODEL", DEFAULT_MODEL_GEMINI)
         ollama_model = os.getenv("OLLAMA_MODEL", DEFAULT_MODEL_OLLAMA)
 
-        if self.pinned_local:
+        if self.force_provider == "claude":
+            self.providers = [ClaudeCLIProvider(), OllamaProvider(model=ollama_model)]
+        elif self.force_provider == "ollama":
             self.providers = [OllamaProvider(model=ollama_model)]
+        elif self.force_provider == "gemini":
+            self.providers = [GeminiCLIProvider(model=gemini_model)]
+        elif self.force_provider == "openrouter":
+            self.providers = [OpenRouterAPIProvider()]
         else:
             self.providers = [
-                GeminiCLIProvider(model=gemini_model),
                 ClaudeCLIProvider(),
+                GeminiCLIProvider(model=gemini_model),
                 OpenRouterAPIProvider(),
                 OllamaProvider(model=ollama_model)
             ]
@@ -1047,7 +1051,11 @@ class ControlPlaneClient:
         if content and isinstance(content, list) and len(content) > 0:
             first = content[0]
             if first.get("type") == "text":
-                return json.loads(first.get("text", "{}"))
+                raw_text = first.get("text", "{}")
+                try:
+                    return json.loads(raw_text)
+                except Exception:
+                    return raw_text
 
         return result
 

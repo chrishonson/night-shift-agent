@@ -330,7 +330,7 @@ def test_a_quota_error_fails_over_to_the_next_provider(manager):
 
 
 def test_the_default_chain_puts_subscription_first_and_local_last(manager):
-    assert isinstance(manager.providers[0], ns.GeminiCLIProvider)
+    assert isinstance(manager.providers[0], ns.ClaudeCLIProvider)
     assert isinstance(manager.providers[-1], ns.OllamaProvider)
     assert len(manager.providers) == 4
 
@@ -339,8 +339,18 @@ def test_force_provider_pins_the_chain_to_local(monkeypatch):
     monkeypatch.setenv("FORCE_PROVIDER", "ollama")
     pinned = ns.ProviderManager()
 
-    assert pinned.pinned_local is True
+    assert pinned.force_provider == "ollama"
     assert [type(p) for p in pinned.providers] == [ns.OllamaProvider]
+
+
+def test_force_provider_claude_still_falls_back_to_local(monkeypatch):
+    monkeypatch.setenv("FORCE_PROVIDER", "claude")
+    pinned = ns.ProviderManager()
+
+    # Claude is a subscription, so exhausting it should reach local inference
+    # rather than ending the run. Pinning narrows the chain, it does not
+    # remove the floor.
+    assert [type(p) for p in pinned.providers] == [ns.ClaudeCLIProvider, ns.OllamaProvider]
 
 
 # ---------------------------------------------------------------------------
