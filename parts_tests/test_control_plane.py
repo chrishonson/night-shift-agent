@@ -329,10 +329,32 @@ def test_a_quota_error_fails_over_to_the_next_provider(manager):
     assert manager.current_index == 1
 
 
-def test_the_default_chain_puts_subscription_first_and_local_last(manager):
-    assert isinstance(manager.providers[0], ns.ClaudeCLIProvider)
+def test_the_default_chain_puts_headless_first_and_local_last(manager):
+    assert isinstance(manager.providers[0], ns.AntigravityCLIProvider)
     assert isinstance(manager.providers[-1], ns.OllamaProvider)
-    assert len(manager.providers) == 4
+    assert [p.kind for p in manager.providers] == [ns.KIND_HEADLESS, ns.KIND_LOCAL]
+
+
+def test_the_default_chain_never_reaches_a_cloud_provider(manager):
+    # Cloud is built but deliberately unwired, so no run can bill per token
+    # without a code change.
+    assert ns.KIND_CLOUD not in [p.kind for p in manager.providers]
+
+
+def test_a_pinned_headless_provider_still_keeps_local_underneath(monkeypatch):
+    monkeypatch.setenv("FORCE_PROVIDER", "claude")
+    pinned = ns.ProviderManager()
+
+    assert isinstance(pinned.providers[0], ns.ClaudeCLIProvider)
+    assert isinstance(pinned.providers[-1], ns.OllamaProvider)
+
+
+def test_an_unwired_force_provider_falls_back_to_the_default_chain(monkeypatch):
+    monkeypatch.setenv("FORCE_PROVIDER", "openrouter")
+    pinned = ns.ProviderManager()
+
+    assert isinstance(pinned.providers[0], ns.AntigravityCLIProvider)
+    assert isinstance(pinned.providers[-1], ns.OllamaProvider)
 
 
 def test_force_provider_pins_the_chain_to_local(monkeypatch):
