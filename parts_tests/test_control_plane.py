@@ -755,3 +755,46 @@ def test_a_result_with_no_content_block_is_returned_as_is(plane):
         "jsonrpc": "2.0", "id": 1, "result": {"cards": [], "generated_at": "now"}
     }))
     assert client.snapshot() == {"cards": [], "generated_at": "now"}
+
+
+def test_client_claim_passes_repos(plane):
+    stub, client = plane(card_claim={"claimed": None})
+    res = client.claim(lane="local", repos=["flashy-card", "level-monitor"])
+    assert res is None
+    assert stub.calls[-1] == ("card_claim", {"lane": "local", "repos": ["flashy-card", "level-monitor"]})
+
+
+def test_detect_mobile_repos_identifies_mobile_projects(tmp_path):
+    # Setup directories
+    (tmp_path / "app-kts").mkdir()
+    (tmp_path / "app-kts" / ".git").mkdir()
+    (tmp_path / "app-kts" / "settings.gradle.kts").write_text("rootProject.name = 'app-kts'")
+
+    (tmp_path / "app-props").mkdir()
+    (tmp_path / "app-props" / ".git").mkdir()
+    (tmp_path / "app-props" / "local.properties").write_text("sdk.dir=/path/to/sdk")
+
+    (tmp_path / "app-manifest").mkdir()
+    (tmp_path / "app-manifest" / ".git").mkdir()
+    (tmp_path / "app-manifest" / "app" / "src" / "main").mkdir(parents=True)
+    (tmp_path / "app-manifest" / "app" / "src" / "main" / "AndroidManifest.xml").write_text("<manifest/>")
+
+    (tmp_path / "non-mobile").mkdir()
+    (tmp_path / "non-mobile" / ".git").mkdir()
+    (tmp_path / "non-mobile" / "package.json").write_text("{}")
+
+    (tmp_path / "non-git-mobile").mkdir()
+    (tmp_path / "non-git-mobile" / "settings.gradle.kts").write_text("rootProject.name = 'non-git'")
+
+    detected = ns.detect_mobile_repos(git_root=tmp_path)
+    assert detected == ["app-kts", "app-manifest", "app-props"]
+
+
+def test_run_control_plane_until_empty_exits_when_no_cards(agent, wire):
+    stub = wire(card_claim={"claimed": None})
+    agent.run_control_plane(lane="local", until_empty=True, repos=["flashy-card"])
+    assert stub.count("card_claim") == 1
+    call_args = stub.calls[0][1]
+    assert call_args["lane"] == "local"
+    assert call_args["repos"] == ["flashy-card"]
+

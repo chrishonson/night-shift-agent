@@ -25,7 +25,7 @@ import random
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Tuple, Dict, Any
+from typing import List, Optional, Tuple, Dict, Any, Union
 from dotenv import load_dotenv
 
 # =============================================================================
@@ -1188,6 +1188,59 @@ class Toolbox:
 # CONTROL PLANE CLIENT & LEASE WORKER
 # =============================================================================
 
+def detect_mobile_repos(git_root: Optional[Union[Path, str]] = None) -> List[str]:
+    """
+    Detect local repositories that are mobile-shaped (Android / KMP Gradle projects).
+    Scans immediate subdirectories of git_root (defaults to GIT_REPOS_DIR or ~/git).
+    Identifies mobile projects by presence of:
+      - settings.gradle.kts or settings.gradle
+      - local.properties (Android SDK location pointer)
+      - AndroidManifest.xml (within standard locations or root)
+      - build.gradle.kts / build.gradle referencing Android plugins
+    """
+    if git_root is None:
+        env_root = os.getenv("GIT_REPOS_DIR")
+        root = Path(env_root).expanduser() if env_root else (Path.home() / "git")
+    else:
+        root = Path(git_root).expanduser()
+
+    if not root.is_dir():
+        return []
+
+    mobile_repos = []
+    for entry in sorted(root.iterdir()):
+        if not entry.is_dir() or entry.name.startswith("."):
+            continue
+        if not (entry / ".git").exists():
+            continue
+
+        is_mobile = False
+        if (entry / "settings.gradle.kts").exists() or (entry / "settings.gradle").exists():
+            is_mobile = True
+        elif (entry / "local.properties").exists():
+            is_mobile = True
+        elif (entry / "app" / "src" / "main" / "AndroidManifest.xml").exists():
+            is_mobile = True
+        elif (entry / "AndroidManifest.xml").exists():
+            is_mobile = True
+        else:
+            for build_file in ("build.gradle.kts", "build.gradle"):
+                bf = entry / build_file
+                if bf.exists():
+                    try:
+                        content = bf.read_text(encoding="utf-8", errors="ignore")
+                        if "android" in content.lower():
+                            is_mobile = True
+                            break
+                    except Exception:
+                        pass
+
+        if is_mobile:
+            mobile_repos.append(entry.name)
+
+    return mobile_repos
+
+
 class ControlPlaneClient:
     """Client for the control plane MCP server."""
     def __init__(self, base_url: str = None, token: str = None, identity_id: str = DEFAULT_IDENTITY_ID):
@@ -1285,10 +1338,12 @@ class ControlPlaneClient:
 
         return result
 
-    def claim(self, lane: str = DEFAULT_LANE, resources: list = None) -> Optional[dict]:
+    def claim(self, lane: str = DEFAULT_LANE, resources: list = None, repos: list = None) -> Optional[dict]:
         args = {"lane": lane}
         if resources:
             args["resources"] = resources
+        if repos:
+            args["repos"] = repos
         res = self.call_tool("card_claim", args)
         if not res or (res.get("claimed") is None and "card" not in res):
             return None
@@ -1989,9 +2044,22 @@ CRITICAL - DO NOT HALLUCINATE:
             os.chdir(orig_cwd)
             self.toolbox.project_dir = orig_cwd
 
-    def run_control_plane(self, lane: str = DEFAULT_LANE, max_runs: int = None, poll_interval_base: float = CONTROL_PLANE_POLL_INTERVAL_BASE):
+    def run_control_plane(
+        self,
+        lane: str = DEFAULT_LANE,
+        max_runs: int = None,
+        poll_interval_base: float = CONTROL_PLANE_POLL_INTERVAL_BASE,
+        until_empty: bool = False,
+        repos: list = None
+    ):
         """Control-plane mode: poll controlPlaneMcp for ready cards in lane, execute with heartbeats."""
-        logger.info(f"🎛️ Night Shift starting in control-plane mode (lane: {lane})...")
+        if repos is None:
+            repos = detect_mobile_repos()
+            logger.info(f"📱 Auto-detected mobile repos: {repos}")
+        elif repos:
+            logger.info(f"🎯 Caller-specified repos: {repos}")
+
+        logger.info(f"🎛️ Night Shift starting in control-plane mode (lane: {lane}, until_empty={until_empty})...")
         runs_count = 0
 
         while True:
@@ -2005,13 +2073,16 @@ CRITICAL - DO NOT HALLUCINATE:
 
             resources = self.detect_resources()
             try:
-                claim_result = self.control_plane.claim(lane=lane, resources=resources)
+                claim_result = self.control_plane.claim(lane=lane, resources=resources, repos=repos)
             except Exception as e:
                 logger.error(f"❌ Error polling control plane: {e}")
                 time.sleep(delay)
                 continue
 
             if not claim_result or not claim_result.get("card"):
+                if until_empty:
+                    logger.info(f"🏁 No matching ready cards in lane '{lane}' (until_empty=True). Loop finished.")
+                    break
                 logger.info(f"😴 No cards ready in lane '{lane}'. Sleeping {delay:.1f}s...")
                 time.sleep(delay)
                 continue
@@ -2110,9 +2181,9 @@ CRITICAL - DO NOT HALLUCINATE:
             else:
                 logger.info("✅ No PR to monitor. Agent complete.")
 
-    def run(self):
+    def run(self, until_empty: bool = False, repos: list = None):
         """Default run entrypoint: takes work from the control plane."""
-        self.run_control_plane()
+        self.run_control_plane(until_empty=until_empty, repos=repos)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Night Shift Agent - Control Plane Worker")
@@ -2121,10 +2192,18 @@ if __name__ == "__main__":
     parser.add_argument('--lane', default=DEFAULT_LANE, help="Control plane lane (default: local)")
     parser.add_argument('--max-runs', type=int, default=None, help="Max cards to process before exiting")
     parser.add_argument('--poll-interval', type=float, default=CONTROL_PLANE_POLL_INTERVAL_BASE, help="Base polling delay in seconds")
+    parser.add_argument('--until-empty', action='store_true', default=False, help="Exit when no matching cards are claimable instead of polling indefinitely")
+    parser.add_argument('--repos', nargs='*', default=None, help="Explicit repos to scope to (defaults to auto-detecting mobile repos)")
     args = parser.parse_args()
     
     agent = NightShiftAgent(args.project_dir)
     if args.mode == "file":
         agent.run_file()
     else:
-        agent.run_control_plane(lane=args.lane, max_runs=args.max_runs, poll_interval_base=args.poll_interval)
+        agent.run_control_plane(
+            lane=args.lane,
+            max_runs=args.max_runs,
+            poll_interval_base=args.poll_interval,
+            until_empty=args.until_empty,
+            repos=args.repos
+        )
