@@ -23,6 +23,7 @@ import shlex
 import difflib
 import random
 import threading
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict, Any
@@ -763,10 +764,14 @@ class Toolbox:
         logger.info(f"🤖 Executing: {command}")
         
         env = os.environ.copy()
-        if cmd_stripped.startswith("gh "):
+        if cmd_stripped.startswith("gh ") or cmd_stripped.startswith("git "):
             gh_token = resolve_gh_token()
-            if gh_token:
+            if gh_token and cmd_stripped.startswith("gh "):
                 env["GITHUB_TOKEN"] = gh_token
+            elif gh_token:
+                # The token is no longer embedded in the remote URL, so git has
+                # to be handed the credential explicitly.
+                env.update(git_auth_env(gh_token, os.getenv("BOT_USERNAME", "agentnightshift")))
 
         try:
             result = self.exec_command(command, env=env)
@@ -1098,6 +1103,51 @@ def resolve_gh_token() -> Optional[str]:
 
     _gh_token_cache = token
     return token
+
+
+# The script reads both answers out of the environment rather than embedding
+# them, so the credential is never a file on disk. git calls it once per prompt
+# with the prompt text as argv[1].
+_ASKPASS_BODY = """#!/bin/sh
+case "$1" in
+  *sername*) printf '%s' "$GIT_BOT_USERNAME" ;;
+  *) printf '%s' "$GIT_BOT_TOKEN" ;;
+esac
+"""
+_askpass_path = None
+
+
+def git_askpass_script() -> str:
+    """Path to the askpass helper, written once per process, owner-only."""
+    global _askpass_path
+    if _askpass_path and os.path.exists(_askpass_path):
+        return _askpass_path
+
+    fd, path = tempfile.mkstemp(prefix="nightshift-askpass-", suffix=".sh")
+    with os.fdopen(fd, "w") as f:
+        f.write(_ASKPASS_BODY)
+    os.chmod(path, 0o700)
+    _askpass_path = path
+    return path
+
+
+def git_auth_env(token: str, username: str) -> dict:
+    """Environment that makes git authenticate as the bot.
+
+    The machine's own credential helper is `gh auth git-credential`, which
+    answers as the human account. Left enabled it would silently win, and the
+    bot's push would be authorised by the wrong identity, so it is cleared for
+    the duration of the command via GIT_CONFIG_* rather than by editing config.
+    """
+    return {
+        "GIT_ASKPASS": git_askpass_script(),
+        "GIT_BOT_USERNAME": username,
+        "GIT_BOT_TOKEN": token,
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "credential.helper",
+        "GIT_CONFIG_VALUE_0": "",
+    }
 
 
 class ControlPlaneClient:

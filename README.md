@@ -130,6 +130,29 @@ memory for the life of the process and is never written to disk or to a log.
 A host with no `gcloud`, no network, or no access to the secret falls through to
 `GH_BOT_TOKEN` and keeps working.
 
+### How git authenticates
+
+Remote URLs must not contain the token. A URL like
+`https://agentnightshift:ghp_...@github.com/owner/repo.git` puts a live
+credential in `.git/config`, where `git remote -v`, a screen share or a pasted
+terminal line discloses it.
+
+With a bare remote URL, the agent supplies the credential itself:
+
+- `gh` commands get `GITHUB_TOKEN`.
+- `git` commands get `GIT_ASKPASS`, pointed at a helper that reads
+  `GIT_BOT_USERNAME` and `GIT_BOT_TOKEN` out of the environment. The token is
+  never written into the script, so it is not on disk.
+
+The agent also clears `credential.helper` for the duration of each git command,
+through `GIT_CONFIG_*` rather than by editing any config file. Most developer
+machines have `gh auth git-credential` configured globally, which answers as the
+human account. Left enabled it wins over askpass, and the bot's push ends up
+authorised by the wrong identity.
+
+Humans need none of this. `gh auth setup-git` covers a bare remote URL for
+interactive use.
+
 ### Rotating the bot token
 
 The old token stays valid until step 3, so there is no window where the agent
