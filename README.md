@@ -84,8 +84,12 @@ When any provider hits a rate limit or quota, it automatically switches to the n
 
 Create a `.env` file (copy from `.env.example`):
 
+The bot PAT is read from GCP Secret Manager first and from `.env` only as a
+fallback, so a rotated secret takes effect everywhere without editing a file on
+each host. See [Rotating the bot token](#rotating-the-bot-token).
+
 ```bash
-# Required
+# Required only on a host without gcloud access to the secret
 GH_BOT_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxx  # GitHub PAT with repo access
 
 # Optional - Agent Configuration
@@ -105,6 +109,55 @@ Your `GH_BOT_TOKEN` needs these permissions:
 - **Pull requests**: Read and write
 - **Metadata**: Read-only
 - **Actions**: Read-only (for CI monitoring)
+
+### Where the bot token comes from
+
+Resolution order, first hit wins:
+
+1. **Secret Manager** — `gh-bot-token-agentnightshift` in GCP project `my-brain-88870`,
+   read through the `gcloud` CLI using your own credentials.
+2. **`GH_BOT_TOKEN`** in the environment or `.env`.
+
+Secret Manager leads on purpose. It is the copy that gets rotated, so a stale
+token left behind in someone's `.env` must not outrank it. The value is held in
+memory for the life of the process and is never written to disk or to a log.
+
+| Variable | Purpose |
+|----------|---------|
+| `GH_BOT_TOKEN_SECRET` | Read a different secret, e.g. for a second bot account. Default `gh-bot-token-agentnightshift`. |
+| `GOOGLE_CLOUD_PROJECT` | Project holding the secret. Default `my-brain-88870`. |
+
+A host with no `gcloud`, no network, or no access to the secret falls through to
+`GH_BOT_TOKEN` and keeps working.
+
+### Rotating the bot token
+
+The old token stays valid until step 3, so there is no window where the agent
+has no credential.
+
+```bash
+# 1. Mint a replacement PAT for agentnightshift on GitHub with the same scopes
+#    (Contents, Pull requests, Metadata, Actions). This step is manual.
+
+# 2. Add it as a new version. Read from a file or a pipe, never as an argument,
+#    so the token does not land in your shell history.
+printf '%s' "$NEW_TOKEN" | gcloud secrets versions add gh-bot-token-agentnightshift \
+  --project=my-brain-88870 --data-file=-
+
+# 3. Revoke the old PAT on GitHub.
+
+# 4. Disable the superseded version so it cannot be read back.
+gcloud secrets versions disable 1 \
+  --secret=gh-bot-token-agentnightshift --project=my-brain-88870
+
+# 5. Verify. Running agents pick up the new version on their next start.
+GITHUB_TOKEN="$(gcloud secrets versions access latest \
+  --secret=gh-bot-token-agentnightshift --project=my-brain-88870)" gh api user --jq .login
+```
+
+Delete any `GH_BOT_TOKEN` line from `.env` on hosts that can reach Secret
+Manager. A leftover entry is dead weight, and it becomes a live stale
+credential the moment Secret Manager is unreachable.
 
 ---
 
@@ -270,7 +323,7 @@ Register a runner at the **organization level** instead:
 
 | Issue | Solution |
 |-------|----------|
-| `GH_BOT_TOKEN not set` | Add token to `.env` file |
+| `GH_BOT_TOKEN not set` | Check `gcloud secrets versions access latest --secret=gh-bot-token-agentnightshift --project=my-brain-88870` works, or set `GH_BOT_TOKEN` in `.env` |
 | `No tasks.txt found` | Create `tasks.txt` in project root |
 | Agent modifies wrong files | Add files to `PROTECTED_FILES` in `agent_night_shift.py` |
 | Build always fails | Check that build command works manually |
