@@ -27,6 +27,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict, Any
 from dotenv import load_dotenv
+from context_capture import ContextCapture, capture_call
 
 # =============================================================================
 # CONFIGURATION & CONSTANTS
@@ -584,6 +585,8 @@ class OpenRouterAPIProvider(LLMProvider):
 class ProviderManager:
     """Manages a list of providers and handles failover."""
     def __init__(self):
+        self.context_capture = None
+        self._context_decision = 0
         self.providers: List[LLMProvider] = []
         self.force_provider = os.getenv("FORCE_PROVIDER", "").lower().strip()
         if self.force_provider:
@@ -622,8 +625,12 @@ class ProviderManager:
             i = (start_index + offset) % len(self.providers)
             provider = self.providers[i]
             
+            self._context_decision += 1
+            decision_id = self._context_decision
+            capture_call(self.context_capture, "assembled", prompt, provider, decision_id)
             try:
                 result = provider.ask(prompt)
+                capture_call(self.context_capture, "provider_finished", decision_id, "returned" if result is not None else "empty")
                 if result is not None:
                     self.current_index = i
                     return result
@@ -637,6 +644,7 @@ class ProviderManager:
                     logger.error("❌ All providers exhausted!")
                     return None
             except QuotaExceededError:
+                capture_call(self.context_capture, "provider_finished", decision_id, "quota_error")
                 logger.warning(f"🛑 {provider.name} Quota/Key Limit. Switching...")
                 next_i = (i + 1) % len(self.providers)
                 if next_i != start_index:  # Haven't looped back yet
@@ -646,6 +654,7 @@ class ProviderManager:
                     logger.error("❌ All providers exhausted!")
                     return None
             except Exception as e:
+                capture_call(self.context_capture, "provider_finished", decision_id, "error")
                 logger.error(f"❌ Critical error in {provider.name}: {e}")
                 # Failover on crash too
                 next_i = (i + 1) % len(self.providers)
@@ -1605,6 +1614,7 @@ CRITICAL - DO NOT HALLUCINATE:
                 last_provider_index = self.llm.current_index
             
             # Context Pruning: preserve system (0) and task (1), prune middle pairs
+            before_pruning = list(messages) if self.llm.context_capture else None
             total_chars = sum(len(m.get("content", "")) for m in messages)
             while len(messages) > 4 and total_chars > MAX_CONTEXT_CHARS:
                 # Remove oldest user/assistant pair after the task (indices 2, 3)
@@ -1612,6 +1622,9 @@ CRITICAL - DO NOT HALLUCINATE:
                 messages.pop(2)  # Was index 3, now 2 after first pop
                 total_chars = sum(len(m.get("content", "")) for m in messages)
                 logger.info(f"🧹 Pruned context: {len(messages)} messages, {total_chars} chars")
+
+            if before_pruning is not None and len(before_pruning) != len(messages):
+                capture_call(self.llm.context_capture, "transformed", before_pruning, messages, MAX_CONTEXT_CHARS)
 
             # LLM Call with messages list
             response = self.llm.ask(messages)
@@ -1877,6 +1890,9 @@ CRITICAL - DO NOT HALLUCINATE:
             run_id = claim_result["run_id"]
             logger.info(f"🎯 Claimed card {card.get('id')}: '{card.get('title')}' (Run {run_id})")
 
+            capture_dir = os.getenv("S4_CONTEXT_CAPTURE_DIR")
+            capture = ContextCapture(capture_dir, card) if capture_dir else None
+            self.llm.context_capture = capture
             heartbeat = LeaseHeartbeatWorker(self.control_plane, run_id)
             heartbeat.start()
 
@@ -1894,6 +1910,7 @@ CRITICAL - DO NOT HALLUCINATE:
             finally:
                 heartbeat.stop()
 
+            release_status = "unknown"
             try:
                 logger.info(f"🏁 Releasing card {card.get('id')} (Run {run_id}) outcome={outcome}")
                 self.control_plane.release(
@@ -1903,8 +1920,12 @@ CRITICAL - DO NOT HALLUCINATE:
                     artifacts=artifacts,
                     error=error_msg
                 )
+                release_status = "acknowledged"
             except Exception as e:
                 logger.error(f"❌ Failed to release card {card.get('id')}: {e}")
+            finally:
+                capture_call(capture, "finish", outcome, release_status)
+                self.llm.context_capture = None
 
             runs_count += 1
 

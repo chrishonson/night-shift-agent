@@ -305,3 +305,8 @@ This project explores **agentic CI/CD**—the idea that an AI agent can:
 ---
 
 *Built with [Gemini AI](https://ai.google.dev/) and [Claude AI](https://claude.ai/).*
+
+## S4 context evidence
+
+Opt-in local context capture and a synthetic pruning-regression replay are
+available. See [capture boundaries, limitations and commands](docs/s4/context-capture.md).

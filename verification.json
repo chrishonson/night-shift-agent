@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "gates": [
+    {"id": "worker_tests", "placement": ["local"], "commands": [".venv/bin/python -m pytest -q parts_tests --cov=agent_night_shift --cov=context_capture --cov-fail-under=50"]},
+    {"id": "worker_syntax", "placement": ["local"], "commands": [".venv/bin/python -m py_compile agent_night_shift.py context_capture.py scripts/context-eval.py"]}
+  ]
+}
