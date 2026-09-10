@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""S4 synthetic worker replay / review-candidate extraction (no model or network)."""
+"""S4 context replay, review candidates and opt-in local model decision probes."""
 import argparse
 from contextlib import redirect_stdout
 import json
@@ -72,12 +72,41 @@ def main():
     generate.add_argument('--output-dir', type=Path, required=True)
     report = sub.add_parser('report')
     report.add_argument('trace', type=Path)
+    decisions = sub.add_parser('decisions')
+    decisions.add_argument('--bundle', type=Path, required=True)
+    decisions.add_argument('--protocol', type=Path, default=Path(__file__).resolve().parents[1] / 'eval/s4/decision-probes.json')
+    decisions.add_argument('--output-dir', type=Path, required=True)
+    decisions.add_argument('--model', required=True)
+    decisions.add_argument('--repetitions', type=int, default=3, choices=[1, 2, 3])
+    decisions.add_argument('--timeout', type=int, default=45)
+    compare = sub.add_parser('compare-decisions')
+    compare.add_argument('--baseline', type=Path, required=True)
+    compare.add_argument('--candidate', type=Path, required=True)
+    compare.add_argument('--out', type=Path, required=True)
     args = parser.parse_args()
     # The legacy worker configures a stdout log handler at import time.
     # Keep the command's stdout machine-readable, including that first import.
     with redirect_stdout(sys.stderr):
-        result = replay(args.output_dir) if args.command == 'replay' else summarize_trace(args.trace)
+        if args.command == 'compare-decisions':
+            from context_decision_eval import compare_probe_reports, write_json
+            result = compare_probe_reports(json.loads(args.baseline.read_text()), json.loads(args.candidate.read_text()))
+            write_json(args.out, result)
+        elif args.command == 'decisions':
+            from context_decision_eval import load_protocol, LocalOllamaDecisionProvider, run_probes
+            bundle, protocol = load_protocol(args.bundle, args.protocol)
+            provider = LocalOllamaDecisionProvider(args.model, args.timeout)
+            result = run_probes(bundle, protocol, provider, args.output_dir, args.repetitions)
+        else:
+            result = replay(args.output_dir) if args.command == 'replay' else summarize_trace(args.trace)
     print(json.dumps(result, indent=2))
+    if args.command == 'compare-decisions':
+        raise SystemExit(2 if result['regression'] else 3 if result['incomparable'] else 0)
+    if args.command == 'decisions':
+        summary = result['summary']
+        if summary['provider_error'] or summary['capture_gaps']:
+            raise SystemExit(3)
+        if summary['failed'] or summary['invalid_output']:
+            raise SystemExit(2)
 
 
 if __name__ == '__main__':

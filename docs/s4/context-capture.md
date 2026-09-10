@@ -79,7 +79,11 @@ self-hosted open-source Onyx. No Unblocked or paid SaaS is required.
 
 The repository gate declares all worker tests, including the actual-loop pruning
 replay, fallback observations, opt-in behavior, release ambiguity, overflow,
-crashed traces, duplicate content, and capture-failure isolation. Coverage starts
-at 50%, rounded down from the observed total (54%); this is not a claim that the
-legacy worker is comprehensively tested. This branch starts on current main and
+crashed traces, duplicate content, and capture-failure isolation. Coverage initially started
+at 50%, rounded down from the observed total (54%). The decision-probe addition
+raised the gate to 55% after measuring 58%; this is not a claim that the legacy
+worker is comprehensively tested. This branch starts on current main and
 does not incorporate the separate unmerged task-evidence implementation.
+
+The next implemented slice adds [frozen local-model decision probes](decision-probes.md),
+with canonical-source joins to these capture events and paired comparison reports.
