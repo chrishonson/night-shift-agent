@@ -171,19 +171,19 @@ def test_an_unresolvable_identity_refuses_to_call_at_all(plane):
 
 def test_claim_returns_none_when_nothing_is_claimable(plane):
     _, client = plane(card_claim={"claimed": None})
-    assert client.claim(lane="local") is None
+    assert client.claim() is None
 
 
-def test_claim_declares_lane_and_physical_resources(plane):
+def test_claim_declares_physical_resources(plane):
     stub, client = plane(card_claim=claim_reply("c1", "r1"))
-    assert client.claim(lane="local", resources=["android-device"])["run_id"] == "r1"
-    assert stub.args_for("card_claim")[0] == {"lane": "local", "resources": ["android-device"]}
+    assert client.claim(resources=["android-device"])["run_id"] == "r1"
+    assert stub.args_for("card_claim")[0] == {"resources": ["android-device"]}
 
 
 def test_claim_omits_resources_when_the_host_has_none(plane):
     stub, client = plane(card_claim={"claimed": None})
-    client.claim(lane="local", resources=[])
-    assert stub.args_for("card_claim")[0] == {"lane": "local"}
+    client.claim(resources=[])
+    assert stub.args_for("card_claim")[0] == {}
 
 
 def test_release_carries_gates_and_artifacts(plane):
@@ -412,7 +412,7 @@ def test_the_worker_releases_each_claimed_card_with_its_own_result(agent, wire):
         return "succeeded", [{"gate_id": "quality", "status": "passed", "duration_ms": 10}], None, None
 
     agent.execute_card = execute
-    agent.run_control_plane(lane="local", max_runs=2)
+    agent.run_control_plane(max_runs=2)
 
     releases = stub.args_for("card_release")
     assert [r["run_id"] for r in releases] == ["r1", "r2"]
@@ -431,7 +431,7 @@ def test_the_worker_releases_failed_with_the_error_when_execution_raises(agent, 
         raise RuntimeError("gate runner missing")
 
     agent.execute_card = boom
-    agent.run_control_plane(lane="local", max_runs=1)
+    agent.run_control_plane(max_runs=1)
 
     released = stub.args_for("card_release")[0]
     assert released["outcome"] == "failed"
@@ -452,7 +452,7 @@ def test_the_worker_keeps_working_when_a_release_fails(agent, wire):
     )
     agent.execute_card = lambda card, run_id, hb: ("succeeded", [], None, None)
 
-    agent.run_control_plane(lane="local", max_runs=2)
+    agent.run_control_plane(max_runs=2)
 
     # A lost release costs one run record, not the worker.
     assert attempts["n"] == 2

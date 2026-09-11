@@ -37,7 +37,7 @@ load_dotenv()
 # Control Plane defaults
 DEFAULT_CONTROL_PLANE_URL = "https://us-central1-my-brain-88870.cloudfunctions.net/controlPlaneMcp"
 DEFAULT_IDENTITY_ID = "night-shift-01"
-DEFAULT_LANE = "local"
+DEFAULT_LANE = None  # Deprecated: control plane no longer uses lanes
 CONTROL_PLANE_POLL_INTERVAL_BASE = 45.0  # seconds
 CONTROL_PLANE_HEARTBEAT_INTERVAL = 60.0  # seconds
 
@@ -1285,10 +1285,14 @@ class ControlPlaneClient:
 
         return result
 
-    def claim(self, lane: str = DEFAULT_LANE, resources: list = None) -> Optional[dict]:
-        args = {"lane": lane}
+    def claim(self, resources: list = None, repos: list = None, lane: str = None) -> Optional[dict]:
+        args = {}
         if resources:
             args["resources"] = resources
+        if repos:
+            args["repos"] = repos
+        if lane:
+            args["lane"] = lane
         res = self.call_tool("card_claim", args)
         if not res or (res.get("claimed") is None and "card" not in res):
             return None
@@ -1989,9 +1993,10 @@ CRITICAL - DO NOT HALLUCINATE:
             os.chdir(orig_cwd)
             self.toolbox.project_dir = orig_cwd
 
-    def run_control_plane(self, lane: str = DEFAULT_LANE, max_runs: int = None, poll_interval_base: float = CONTROL_PLANE_POLL_INTERVAL_BASE):
-        """Control-plane mode: poll controlPlaneMcp for ready cards in lane, execute with heartbeats."""
-        logger.info(f"🎛️ Night Shift starting in control-plane mode (lane: {lane})...")
+    def run_control_plane(self, max_runs: int = None, poll_interval_base: float = CONTROL_PLANE_POLL_INTERVAL_BASE, lane: str = None, **kwargs):
+        """Control-plane mode: poll controlPlaneMcp for ready cards, execute with heartbeats."""
+        lane_str = f" (lane: {lane})" if lane else ""
+        logger.info(f"🎛️ Night Shift starting in control-plane mode{lane_str}...")
         runs_count = 0
 
         while True:
@@ -2005,14 +2010,15 @@ CRITICAL - DO NOT HALLUCINATE:
 
             resources = self.detect_resources()
             try:
-                claim_result = self.control_plane.claim(lane=lane, resources=resources)
+                claim_result = self.control_plane.claim(resources=resources, lane=lane)
             except Exception as e:
                 logger.error(f"❌ Error polling control plane: {e}")
                 time.sleep(delay)
                 continue
 
             if not claim_result or not claim_result.get("card"):
-                logger.info(f"😴 No cards ready in lane '{lane}'. Sleeping {delay:.1f}s...")
+                no_cards_str = f" in lane '{lane}'" if lane else ""
+                logger.info(f"😴 No cards ready{no_cards_str}. Sleeping {delay:.1f}s...")
                 time.sleep(delay)
                 continue
 
@@ -2118,7 +2124,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Night Shift Agent - Control Plane Worker")
     parser.add_argument('--project-dir', default='.', help="Working project directory")
     parser.add_argument('--mode', choices=['control-plane', 'file'], default='control-plane', help="Where work comes from: 'control-plane' (the board) or 'file' (local tasks.txt)")
-    parser.add_argument('--lane', default=DEFAULT_LANE, help="Control plane lane (default: local)")
+    parser.add_argument('--lane', default=None, help="[Deprecated] Legacy control plane lane")
     parser.add_argument('--max-runs', type=int, default=None, help="Max cards to process before exiting")
     parser.add_argument('--poll-interval', type=float, default=CONTROL_PLANE_POLL_INTERVAL_BASE, help="Base polling delay in seconds")
     args = parser.parse_args()
@@ -2127,4 +2133,4 @@ if __name__ == "__main__":
     if args.mode == "file":
         agent.run_file()
     else:
-        agent.run_control_plane(lane=args.lane, max_runs=args.max_runs, poll_interval_base=args.poll_interval)
+        agent.run_control_plane(max_runs=args.max_runs, poll_interval_base=args.poll_interval, lane=args.lane)
