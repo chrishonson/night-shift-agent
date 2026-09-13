@@ -25,7 +25,7 @@ import random
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Tuple, Dict, Any
+from typing import List, Optional, Tuple, Dict, Any, Union
 from dotenv import load_dotenv
 from context_capture import ContextCapture, capture_call
 
@@ -51,10 +51,28 @@ CONTROL_PLANE_HEARTBEAT_INTERVAL = 60.0  # seconds
 # - gemini-3-flash-preview
 # Aliases: auto, auto-gemini-2.5, auto-gemini-3, pro, flash, flash-lite
 # Embedding: gemini-embedding-001
-DEFAULT_PROVIDER = "gemini"
+# How the agent reaches a model. This is the axis that decides auth, cost and
+# failure mode, so every provider declares one.
+#   headless  a coding CLI driven in print mode, paid by subscription
+#   local     inference on this machine, paid in electricity
+#   cloud     an HTTP API billed per token. Built, deliberately not wired.
+KIND_HEADLESS = "headless"
+KIND_LOCAL = "local"
+KIND_CLOUD = "cloud"
+
+# The headless providers the default chain walks, in order. Every headless
+# provider below is selectable by name via FORCE_PROVIDER, but only these are
+# reached without being asked for.
+HEADLESS_ORDER = ["antigravity"]
 DEFAULT_MODEL_GEMINI = "gemini-3-flash-preview"
 DEFAULT_MODEL_OPENROUTER = "google/gemini-2.0-flash-exp:free"
-DEFAULT_MODEL_CLAUDE = "claude-3-5-sonnet-20241022" 
+DEFAULT_MODEL_CLAUDE = "claude-sonnet-5"
+# -low could not complete a Compose UI card: it read files for 80 iterations
+# without writing the screen. -high completes the same card.
+DEFAULT_MODEL_ANTIGRAVITY = "gemini-3.8-flash-high"
+# Seconds agy may spend on one print. Large repos produce large prompts and
+# 300s was not enough: three calls on the control-plane repo hit it.
+ANTIGRAVITY_PRINT_TIMEOUT_S = 900
 DEFAULT_MODEL_OLLAMA = "deepseek-r1:32b"
 OLLAMA_BASE_URL = "http://localhost:11434/api/generate" 
 
@@ -226,6 +244,8 @@ from typing import List, Optional
 
 class LLMProvider(ABC):
     """Abstract base class for LLM providers (CLI or API)."""
+
+    kind: str = KIND_HEADLESS
     
     @abstractmethod
     def ask(self, prompt_or_messages) -> Optional[str]:
@@ -261,7 +281,112 @@ class LLMProvider(ABC):
             return '\n'.join(lines).strip()
         return text
 
+class AntigravityCLIProvider(LLMProvider):
+    """Google's Antigravity CLI (`agy`) in headless print mode.
+
+    Two quirks drive the shape of this class:
+
+    `--print` takes the prompt as its own value, so it must be attached to the
+    flag. Piping on stdin makes agy print its help instead of answering.
+
+    Headless mode auto-denies any tool the model reaches for and then returns
+    no answer at all. That is what we want, since this agent drives its own
+    tools, but it means an attempted tool call yields empty output rather than
+    an error. That case is detected and reported as a failed attempt so the
+    chain falls through to local rather than looping on nothing.
+    """
+
+    kind = KIND_HEADLESS
+
+    # agy prints this to stdout when headless permission denial ate the turn.
+    _TOOL_DENIED_MARKER = "no output produced"
+
+    def __init__(self, model=DEFAULT_MODEL_ANTIGRAVITY):
+        super().__init__()
+        self.model = model
+
+    @property
+    def name(self): return f"Antigravity CLI ({self.model})"
+
+    def ask(self, prompt_or_messages) -> Optional[str]:
+        if isinstance(prompt_or_messages, list):
+            prompt = self.messages_to_string(prompt_or_messages)
+        else:
+            prompt = prompt_or_messages
+
+        prompt_logger.debug(
+            f"{'='*80}\n>>> PROMPT TO {self.name}\n{'='*80}\n{prompt}\n{'='*80}\n"
+        )
+
+        for attempt in range(MAX_RETRIES):
+            try:
+                # No shell, so the prompt needs no quoting. Prompts run ~40KB
+                # against a 1MB ARG_MAX, which is ample headroom.
+                # agy's own --print-timeout defaults to 5m and our subprocess
+                # timeout was also 300s, so the two raced and a slow answer was
+                # killed here rather than returned. Give agy the shorter budget
+                # of the two so it fails in a way we can read.
+                result = subprocess.run(
+                    ["agy", f"--model={self.model}",
+                     f"--print-timeout={ANTIGRAVITY_PRINT_TIMEOUT_S}s",
+                     f"--print={prompt}"],
+                    capture_output=True, text=True,
+                    timeout=ANTIGRAVITY_PRINT_TIMEOUT_S + 60,
+                    stdin=subprocess.DEVNULL
+                )
+
+                self._log_raw_response(attempt, result)
+                self._check_quota(result.stdout + result.stderr)
+
+                if result.returncode != 0:
+                    logger.warning(f"⚠️ {self.name} Error ({attempt+1}/{MAX_RETRIES}): {result.stderr}")
+                    self._backoff(attempt)
+                    continue
+
+                out = result.stdout.strip()
+                if self._TOOL_DENIED_MARKER in out.lower():
+                    logger.warning(
+                        f"⚠️ {self.name} tried to call a tool, which headless mode denied, "
+                        f"so it returned no answer ({attempt+1}/{MAX_RETRIES})."
+                    )
+                    self._backoff(attempt)
+                    continue
+
+                if out:
+                    return self.strip_markdown_code_blocks(out)
+
+                logger.warning(f"⚠️ {self.name} returned nothing ({attempt+1}/{MAX_RETRIES}).")
+                self._backoff(attempt)
+
+            except QuotaExceededError:
+                raise
+            except Exception as e:
+                logger.warning(f"⚠️ {self.name} Exception ({attempt+1}/{MAX_RETRIES}): {e}")
+                self._backoff(attempt)
+        return None
+
+    def _log_raw_response(self, attempt, result):
+        prompt_logger.debug(
+            f"{'='*80}\n<<< RAW RESPONSE ({attempt+1}) RC:{result.returncode}\n{'='*80}\n"
+            f"STDOUT:\n{result.stdout}\n{'~'*40}\nSTDERR:\n{result.stderr}\n{'='*80}\n"
+        )
+
+    def _check_quota(self, combined_output):
+        lower = combined_output.lower()
+        if any(x in lower for x in ["quota exceeded", "resource exhausted", "rate limit"]):
+            logger.error(f"🚨 {self.name} Quota Exceeded!")
+            raise QuotaExceededError(f"{self.name} Quota Exceeded")
+        if "429" in lower and ("error" in lower or "too many" in lower):
+            logger.error(f"🚨 {self.name} Rate Limited (429)!")
+            raise QuotaExceededError(f"{self.name} Rate Limited")
+
+    def _backoff(self, attempt):
+        if attempt < MAX_RETRIES - 1:
+            time.sleep(RETRY_BASE_DELAY * (2 ** attempt))
+
 class GeminiCLIProvider(LLMProvider):
+    kind = KIND_HEADLESS
+
     def __init__(self, model=DEFAULT_MODEL_GEMINI):
         super().__init__()
         self.model = model
@@ -340,6 +465,8 @@ class GeminiCLIProvider(LLMProvider):
             time.sleep(RETRY_BASE_DELAY * (2 ** attempt))
 
 class ClaudeCLIProvider(LLMProvider):
+    kind = KIND_HEADLESS
+
     def __init__(self, model=""):
         super().__init__()
         self.model = model
@@ -411,6 +538,8 @@ class ClaudeCLIProvider(LLMProvider):
             time.sleep(RETRY_BASE_DELAY * (2 ** attempt))
 
 class OllamaProvider(LLMProvider):
+    kind = KIND_LOCAL
+
     """Ollama provider with KV cache optimization.
     
     Ollama's /api/chat endpoint automatically caches previous tokens in the KV cache
@@ -493,6 +622,8 @@ class OllamaProvider(LLMProvider):
 
 
 class OpenRouterAPIProvider(LLMProvider):
+    kind = KIND_CLOUD
+
     def __init__(self):
         super().__init__()
         
@@ -594,28 +725,37 @@ class ProviderManager:
         self._init_providers()
 
     def _init_providers(self):
-        # Determine order based on env preference
-        gemini_model = os.getenv("PREFERRED_AGENT_MODEL", DEFAULT_MODEL_GEMINI)
-        ollama_model = os.getenv("OLLAMA_MODEL", DEFAULT_MODEL_OLLAMA)
+        """Build the chain: headless first, local as the fallback under it.
 
-        if self.force_provider == "claude":
-            self.providers = [ClaudeCLIProvider(), OllamaProvider(model=ollama_model)]
-        elif self.force_provider == "ollama":
-            self.providers = [OllamaProvider(model=ollama_model)]
-        elif self.force_provider == "gemini":
-            self.providers = [GeminiCLIProvider(model=gemini_model)]
-        elif self.force_provider == "openrouter":
-            self.providers = [OpenRouterAPIProvider()]
+        Cloud is not wired. OpenRouterAPIProvider still exists but nothing
+        selects it, so no run can bill per token without a code change.
+        """
+        gemini_model = os.getenv("GEMINI_MODEL", os.getenv("PREFERRED_AGENT_MODEL", DEFAULT_MODEL_GEMINI))
+        ollama_model = os.getenv("OLLAMA_MODEL", DEFAULT_MODEL_OLLAMA)
+        claude_model = os.getenv("CLAUDE_MODEL", DEFAULT_MODEL_CLAUDE)
+        antigravity_model = os.getenv("ANTIGRAVITY_MODEL", DEFAULT_MODEL_ANTIGRAVITY)
+
+        headless = {
+            "antigravity": lambda: AntigravityCLIProvider(model=antigravity_model),
+            "claude": lambda: ClaudeCLIProvider(model=claude_model),
+            "gemini": lambda: GeminiCLIProvider(model=gemini_model),
+        }
+        local = OllamaProvider(model=ollama_model)
+
+        if self.force_provider == "ollama":
+            self.providers = [local]
+        elif self.force_provider in headless:
+            self.providers = [headless[self.force_provider](), local]
         else:
-            self.providers = [
-                ClaudeCLIProvider(),
-                GeminiCLIProvider(model=gemini_model),
-                OpenRouterAPIProvider(),
-                OllamaProvider(model=ollama_model)
-            ]
+            if self.force_provider:
+                logger.warning(
+                    f"⚠️ FORCE_PROVIDER={self.force_provider} is not a wired provider. "
+                    f"Wired: {', '.join(list(headless) + ['ollama'])}. Falling back to the default chain."
+                )
+            self.providers = [headless[n]() for n in HEADLESS_ORDER] + [local]
 
         self.current_index = 0
-        logger.info(f"🔌 Provider Chain: {[p.name for p in self.providers]}")
+        logger.info(f"🔌 Provider Chain: {[f'{p.name} [{p.kind}]' for p in self.providers]}")
 
     def ask(self, prompt: str) -> Optional[str]:
         # Start from the last working provider, not always from 0
@@ -874,7 +1014,10 @@ class Toolbox:
         run_gate_script = self.project_dir / "scripts" / "run-gate.py"
 
         if verification_file.exists() and run_gate_script.exists():
-            test_cmd = f"python3 {run_gate_script} quality"
+            # The card declares the gates it is judged by. Anything else makes
+            # every TDD loop read red no matter what the tests actually did.
+            gate_id = self.target_gates[0] if self.target_gates else "quality"
+            test_cmd = f"python3 {run_gate_script} {gate_id}"
         else:
             test_cmd = "./gradlew testDebugUnitTest"
         
@@ -1054,6 +1197,59 @@ class Toolbox:
 # CONTROL PLANE CLIENT & LEASE WORKER
 # =============================================================================
 
+def detect_mobile_repos(git_root: Optional[Union[Path, str]] = None) -> List[str]:
+    """
+    Detect local repositories that are mobile-shaped (Android / KMP Gradle projects).
+    Scans immediate subdirectories of git_root (defaults to GIT_REPOS_DIR or ~/git).
+    Identifies mobile projects by presence of:
+      - settings.gradle.kts or settings.gradle
+      - local.properties (Android SDK location pointer)
+      - AndroidManifest.xml (within standard locations or root)
+      - build.gradle.kts / build.gradle referencing Android plugins
+    """
+    if git_root is None:
+        env_root = os.getenv("GIT_REPOS_DIR")
+        root = Path(env_root).expanduser() if env_root else (Path.home() / "git")
+    else:
+        root = Path(git_root).expanduser()
+
+    if not root.is_dir():
+        return []
+
+    mobile_repos = []
+    for entry in sorted(root.iterdir()):
+        if not entry.is_dir() or entry.name.startswith("."):
+            continue
+        if not (entry / ".git").exists():
+            continue
+
+        is_mobile = False
+        if (entry / "settings.gradle.kts").exists() or (entry / "settings.gradle").exists():
+            is_mobile = True
+        elif (entry / "local.properties").exists():
+            is_mobile = True
+        elif (entry / "app" / "src" / "main" / "AndroidManifest.xml").exists():
+            is_mobile = True
+        elif (entry / "AndroidManifest.xml").exists():
+            is_mobile = True
+        else:
+            for build_file in ("build.gradle.kts", "build.gradle"):
+                bf = entry / build_file
+                if bf.exists():
+                    try:
+                        content = bf.read_text(encoding="utf-8", errors="ignore")
+                        if "android" in content.lower():
+                            is_mobile = True
+                            break
+                    except Exception:
+                        pass
+
+        if is_mobile:
+            mobile_repos.append(entry.name)
+
+    return mobile_repos
+
+
 class ControlPlaneClient:
     """Client for the control plane MCP server."""
     def __init__(self, base_url: str = None, token: str = None, identity_id: str = DEFAULT_IDENTITY_ID):
@@ -1151,10 +1347,12 @@ class ControlPlaneClient:
 
         return result
 
-    def claim(self, lane: str = DEFAULT_LANE, resources: list = None) -> Optional[dict]:
+    def claim(self, lane: str = DEFAULT_LANE, resources: list = None, repos: list = None) -> Optional[dict]:
         args = {"lane": lane}
         if resources:
             args["resources"] = resources
+        if repos:
+            args["repos"] = repos
         res = self.call_tool("card_claim", args)
         if not res or (res.get("claimed") is None and "card" not in res):
             return None
@@ -1859,9 +2057,22 @@ CRITICAL - DO NOT HALLUCINATE:
             os.chdir(orig_cwd)
             self.toolbox.project_dir = orig_cwd
 
-    def run_control_plane(self, lane: str = DEFAULT_LANE, max_runs: int = None, poll_interval_base: float = CONTROL_PLANE_POLL_INTERVAL_BASE):
+    def run_control_plane(
+        self,
+        lane: str = DEFAULT_LANE,
+        max_runs: int = None,
+        poll_interval_base: float = CONTROL_PLANE_POLL_INTERVAL_BASE,
+        until_empty: bool = False,
+        repos: list = None
+    ):
         """Control-plane mode: poll controlPlaneMcp for ready cards in lane, execute with heartbeats."""
-        logger.info(f"🎛️ Night Shift starting in control-plane mode (lane: {lane})...")
+        if repos is None:
+            repos = detect_mobile_repos()
+            logger.info(f"📱 Auto-detected mobile repos: {repos}")
+        elif repos:
+            logger.info(f"🎯 Caller-specified repos: {repos}")
+
+        logger.info(f"🎛️ Night Shift starting in control-plane mode (lane: {lane}, until_empty={until_empty})...")
         runs_count = 0
 
         while True:
@@ -1875,13 +2086,16 @@ CRITICAL - DO NOT HALLUCINATE:
 
             resources = self.detect_resources()
             try:
-                claim_result = self.control_plane.claim(lane=lane, resources=resources)
+                claim_result = self.control_plane.claim(lane=lane, resources=resources, repos=repos)
             except Exception as e:
                 logger.error(f"❌ Error polling control plane: {e}")
                 time.sleep(delay)
                 continue
 
             if not claim_result or not claim_result.get("card"):
+                if until_empty:
+                    logger.info(f"🏁 No matching ready cards in lane '{lane}' (until_empty=True). Loop finished.")
+                    break
                 logger.info(f"😴 No cards ready in lane '{lane}'. Sleeping {delay:.1f}s...")
                 time.sleep(delay)
                 continue
@@ -1988,9 +2202,9 @@ CRITICAL - DO NOT HALLUCINATE:
             else:
                 logger.info("✅ No PR to monitor. Agent complete.")
 
-    def run(self):
+    def run(self, until_empty: bool = False, repos: list = None):
         """Default run entrypoint: takes work from the control plane."""
-        self.run_control_plane()
+        self.run_control_plane(until_empty=until_empty, repos=repos)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Night Shift Agent - Control Plane Worker")
@@ -1999,10 +2213,18 @@ if __name__ == "__main__":
     parser.add_argument('--lane', default=DEFAULT_LANE, help="Control plane lane (default: local)")
     parser.add_argument('--max-runs', type=int, default=None, help="Max cards to process before exiting")
     parser.add_argument('--poll-interval', type=float, default=CONTROL_PLANE_POLL_INTERVAL_BASE, help="Base polling delay in seconds")
+    parser.add_argument('--until-empty', action='store_true', default=False, help="Exit when no matching cards are claimable instead of polling indefinitely")
+    parser.add_argument('--repos', nargs='*', default=None, help="Explicit repos to scope to (defaults to auto-detecting mobile repos)")
     args = parser.parse_args()
     
     agent = NightShiftAgent(args.project_dir)
     if args.mode == "file":
         agent.run_file()
     else:
-        agent.run_control_plane(lane=args.lane, max_runs=args.max_runs, poll_interval_base=args.poll_interval)
+        agent.run_control_plane(
+            lane=args.lane,
+            max_runs=args.max_runs,
+            poll_interval_base=args.poll_interval,
+            until_empty=args.until_empty,
+            repos=args.repos
+        )
