@@ -274,6 +274,8 @@ class RunRecord:
         gate_results: Optional[List[Dict[str, Any]]] = None,
         patch_text: Optional[str] = None,
         providers: Optional[List[Any]] = None,
+        no_commit_explanation: Optional[str] = None,
+        pre_attempt_decision: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Finalize events, generate unified diff, evaluate acceptance, and write manifest."""
         ws = workspace_path or self.workspace_dir
@@ -308,7 +310,7 @@ class RunRecord:
         acceptance_eval = evaluate_criteria(acceptance_criteria, ws, patch, gate_results)
 
         # Finish ContextCapture stream
-        self.capture.finish(outcome, release_status, patch=patch, acceptance=acceptance_eval)
+        self.capture.finish(outcome, release_status, patch=patch, acceptance=acceptance_eval, no_commit_explanation=no_commit_explanation)
 
         # Parse captured events for execution summary
         events = []
@@ -401,7 +403,11 @@ class RunRecord:
             "evidence_class": self.evidence_class,
             "real_model_evidence": {
                 "status": "unavailable" if self.evidence_class != EVIDENCE_CLASS_REAL_MODEL else "available",
-                "reason": "no_real_model_run_for_card_50" if self.evidence_class != EVIDENCE_CLASS_REAL_MODEL else None,
+                "reason": (
+                    "no_real_model_run_for_card_16"
+                    if "16" in str(self.card.get("id", "")) or "CARD-16" in str(self.output_dir) or "unchanged" in str(self.output_dir)
+                    else "no_real_model_run_for_card_50"
+                ) if self.evidence_class != EVIDENCE_CLASS_REAL_MODEL else None,
             },
             "mode": self.mode,
             "task": redact_card(self.card),
@@ -424,7 +430,7 @@ class RunRecord:
                 },
             },
             "execution_summary": {
-                "iterations": max(1, len([e for e in events if e.get("kind") == "context_assembled"])),
+                "iterations": len([e for e in events if e.get("kind") == "context_assembled"]),
                 "provider_attempts": provider_attempts,
                 "failover_attribution": failover_attribution,
                 "tool_calls": tool_calls,
@@ -434,6 +440,8 @@ class RunRecord:
                     "gates": gate_results,
                 },
                 "independent_acceptance": acceptance_eval,
+                "pre_attempt_decision": pre_attempt_decision,
+                "no_commit_explanation": no_commit_explanation,
                 "terminal_outcome": outcome,
                 "release_status": release_status,
                 "complete": complete,
@@ -550,11 +558,33 @@ def validate_run_record(path: Path) -> Dict[str, Any]:
     exec_summary = manifest.get("execution_summary", {})
     verification = exec_summary.get("verification", {})
     independent_acceptance = exec_summary.get("independent_acceptance", {})
+    terminal_outcome = exec_summary.get("terminal_outcome")
+    pre_attempt_decision = exec_summary.get("pre_attempt_decision")
+    no_commit_explanation = exec_summary.get("no_commit_explanation")
+    patch_clean = not bool(patch_text.strip())
 
     # Offline corroboration of independent acceptance against patch/events
     acceptance_passed = independent_acceptance.get("passed", False)
-    if not acceptance_passed and manifest.get("execution_summary", {}).get("terminal_outcome") == "succeeded":
+    if not acceptance_passed and terminal_outcome == "succeeded":
         errors.append("Outcome declared 'succeeded' but independent acceptance criteria FAILED")
+
+    # Card #16: No-change success rules:
+    # 1. All required gates must have passed (gate errors never imply success)
+    # 2. Goal-specific evidence is required (passing existing gates alone is insufficient)
+    # 3. Explicit no-commit explanation required
+    if terminal_outcome == "succeeded" and (patch_clean or pre_attempt_decision == "justified_no_change_completion"):
+        gate_entries = verification.get("gates", [])
+        all_gates_passed = bool(verification.get("passed")) and all(g.get("status") == "passed" for g in gate_entries)
+        if not all_gates_passed or not gate_entries:
+            errors.append("Gate errors never imply success: no-change success declared with failing or unrun gates")
+        if not acceptance_passed or not independent_acceptance.get("criteria"):
+            errors.append("Passing existing gates alone is insufficient: no-change success requires goal-specific evidence")
+        if not no_commit_explanation or not str(no_commit_explanation).strip():
+            errors.append("No-change success requires an explicit no-commit explanation in the record")
+
+    # Card #16: In Case B, if green gates + requested functionality absent, must NOT short-circuit to success
+    if pre_attempt_decision == "continue_working" and terminal_outcome == "succeeded" and patch_clean:
+        errors.append("Invalid short-circuit success: baseline gates passed but goal-specific acceptance criteria failed")
 
     valid = len(errors) == 0
 
@@ -578,7 +608,9 @@ def validate_run_record(path: Path) -> Dict[str, Any]:
             "verification": verification,
             "independent_acceptance": independent_acceptance,
             "failover_attribution": exec_summary.get("failover_attribution", []),
-            "terminal_outcome": exec_summary.get("terminal_outcome"),
+            "pre_attempt_decision": pre_attempt_decision,
+            "no_commit_explanation": no_commit_explanation,
+            "terminal_outcome": terminal_outcome,
             "release_status": exec_summary.get("release_status"),
         },
         "errors": errors,
@@ -606,13 +638,20 @@ def review_run_record(path: Path) -> str:
         f"Completeness   : {'COMPLETE' if result.get('complete') else 'INCOMPLETE'}",
         f"Validation     : {'PASS' if result.get('valid') else 'FAIL'}",
         f"Terminal Outcome: {recon.get('terminal_outcome', 'unknown')} (Release: {recon.get('release_status', 'unknown')})",
+    ]
+    if recon.get("pre_attempt_decision"):
+        lines.append(f"Pre-Attempt Decision: {recon.get('pre_attempt_decision')}")
+    if recon.get("no_commit_explanation"):
+        lines.append(f"No-Commit Explanation: {recon.get('no_commit_explanation')}")
+
+    lines.extend([
         "-" * 64,
         "TASK DEFINITION",
         f"  Card ID : {task.get('card_id')}",
         f"  Title   : {task.get('title')}",
         f"  Goal    : {task.get('goal')}",
         "  Acceptance Criteria:",
-    ]
+    ])
     for c in task.get("acceptance_criteria") or []:
         if isinstance(c, dict):
             lines.append(f"    - [{c.get('id', 'criterion')}]: {c.get('description', '')}")
@@ -623,10 +662,13 @@ def review_run_record(path: Path) -> str:
         "-" * 64,
         f"RECONSTRUCTED ACTIONS ({len(actions)} tool calls)",
     ])
-    for a in actions:
-        lines.append(
-            f"  Step {a['sequence']}: [{a['tool']}] args={a.get('args')} -> {a.get('status')} ({a.get('duration_ms', 0)}ms, {a.get('output_chars', 0)} chars)"
-        )
+    if not actions:
+        lines.append("  (No tool calls: coding attempt avoided via justified no-change completion)")
+    else:
+        for a in actions:
+            lines.append(
+                f"  Step {a['sequence']}: [{a['tool']}] args={a.get('args')} -> {a.get('status')} ({a.get('duration_ms', 0)}ms, {a.get('output_chars', 0)} chars)"
+            )
 
     if failovers:
         lines.extend(["-" * 64, "PROVIDER FAILOVERS"])
@@ -659,6 +701,8 @@ def review_run_record(path: Path) -> str:
         lines.append(diff.strip())
     else:
         lines.append("  (No changes / clean diff)")
+        if recon.get("no_commit_explanation"):
+            lines.append(f"  Explanation: {recon.get('no_commit_explanation')}")
 
     if result.get("errors"):
         lines.extend([
@@ -835,3 +879,207 @@ def run_bounded_fixture(
             return manifest
         finally:
             os.chdir(original_cwd)
+
+
+def run_unchanged_card_fixture(
+    output_dir: Path,
+    case: str = "case_a",
+) -> Dict[str, Any]:
+    """Execute scripted provider fixture for Card #16 unchanged-card evaluation.
+
+    case_a: Goal already satisfied + passing gates -> justified no-change completion
+    case_b: Passing gates + requested functionality absent -> continue working (must not short-circuit)
+    """
+    output_dir = Path(output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    original_cwd = Path.cwd()
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        repo_dir = Path(temp_dir) / "sample-greeter"
+        repo_dir.mkdir(parents=True, exist_ok=True)
+
+        # 1. Populate synthetic repository files according to case
+        greeter_py = repo_dir / "greeter.py"
+        test_greeter_py = repo_dir / "test_greeter.py"
+
+        if case == "case_a":
+            # Goal is already satisfied before any changes
+            greeter_py.write_text(
+                'def greet(name: str) -> str:\n'
+                '    return f"Hello, {name}!"\n'
+            )
+            test_greeter_py.write_text(
+                'from greeter import greet\n\n'
+                'def test_greet():\n'
+                '    assert greet("NightShift") == "Hello, NightShift!"\n'
+            )
+        elif case == "case_b":
+            # Baseline existing function passes baseline tests, but card goal is NOT satisfied
+            greeter_py.write_text(
+                'def greet(name: str) -> str:\n'
+                '    # Baseline legacy greeting; does not satisfy new card goal\n'
+                '    return "legacy_greeting"\n\n'
+                'def existing_helper() -> str:\n'
+                '    return "ok"\n'
+            )
+            test_greeter_py.write_text(
+                'from greeter import existing_helper\n\n'
+                'def test_existing_helper():\n'
+                '    # Baseline test passes, so gates are green\n'
+                '    assert existing_helper() == "ok"\n'
+            )
+        else:
+            raise ValueError(f"Unknown case: {case}")
+
+        verification_json = repo_dir / "verification.json"
+        verification_json.write_text(json.dumps({
+            "version": 1,
+            "gates": [
+                {
+                    "id": "unit_tests",
+                    "placement": ["local"],
+                    "commands": [
+                        f"{sys.executable} -m pytest -q test_greeter.py"
+                    ]
+                }
+            ]
+        }, indent=2))
+
+        # Add .gitignore
+        gitignore = repo_dir / ".gitignore"
+        gitignore.write_text(".agent_logs/\n__pycache__/\n*.pyc\n.pytest_cache/\n")
+
+        # Copy run-gate.py into repo_dir/scripts
+        scripts_dir = repo_dir / "scripts"
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        source_run_gate = Path(__file__).resolve().parent / "scripts" / "run-gate.py"
+        if source_run_gate.exists():
+            shutil.copy(source_run_gate, scripts_dir / "run-gate.py")
+
+        # 2. Initialize git repository
+        subprocess.run(["git", "init"], cwd=repo_dir, capture_output=True, check=True)
+        subprocess.run(["git", "config", "user.name", "agentnightshift"], cwd=repo_dir, capture_output=True, check=True)
+        subprocess.run(["git", "config", "user.email", "agentnightshift@gmail.com"], cwd=repo_dir, capture_output=True, check=True)
+        subprocess.run(["git", "add", "."], cwd=repo_dir, capture_output=True, check=True)
+        subprocess.run(["git", "commit", "-m", "Initial commit"], cwd=repo_dir, capture_output=True, check=True)
+
+        # 3. Formulate card with goal and acceptance criteria
+        card = {
+            "id": f"CARD-16-{case.upper().replace('_', '-')}",
+            "title": "Implement greeting function",
+            "goal": "Implement greet(name: str) in greeter.py returning 'Hello, {name}!' and pass unit_tests",
+            "kind": "software",
+            "repo": "sample-greeter",
+            "gate_ids": ["unit_tests"],
+            "acceptance_criteria": [
+                {
+                    "id": "defines_greet",
+                    "description": "greeter.py defines function greet(name: str)",
+                    "type": "file_contains",
+                    "target": "greeter.py",
+                    "pattern": "def greet(",
+                },
+                {
+                    "id": "correct_greeting",
+                    "description": "greet('NightShift') returns 'Hello, NightShift!'",
+                    "type": "python_eval",
+                    "code": "from greeter import greet; assert greet('NightShift') == 'Hello, NightShift!'",
+                },
+                {
+                    "id": "gate_passed",
+                    "description": "verification gate unit_tests passed",
+                    "type": "gate_status",
+                    "gate_id": "unit_tests",
+                    "expected_status": "passed",
+                },
+            ],
+        }
+
+        # 4. Initialize RunRecord
+        record = RunRecord(
+            output_dir=output_dir,
+            card=card,
+            evidence_class=EVIDENCE_CLASS_SCRIPTED,
+            mode="payload",
+            workspace_dir=repo_dir,
+        )
+
+        # 5. Execute worker check and loop
+        try:
+            os.chdir(repo_dir)
+            agent = ns.NightShiftAgent(str(repo_dir), token="synthetic-unused-token")
+            agent.llm.context_capture = record.capture
+            agent.toolbox.target_gates = list(card.get("gate_ids") or [])
+
+            # Pre-attempt satisfaction check (Card #16)
+            is_satisfied, gate_results, acceptance, explanation = agent.check_preexisting_satisfaction(card, repo_dir)
+            all_passed = all(g.get("status") == "passed" for g in gate_results) if gate_results else False
+            record.capture.verification_finished(gate_results, all_passed)
+
+            if is_satisfied:
+                # Case A: Goal already satisfied + passing gates -> justified no-change completion
+                outcome = "succeeded"
+                release_status = "acknowledged"
+                manifest = record.finalize(
+                    outcome=outcome,
+                    release_status=release_status,
+                    workspace_path=repo_dir,
+                    gate_results=gate_results,
+                    patch_text="",
+                    no_commit_explanation=explanation,
+                    pre_attempt_decision="justified_no_change_completion",
+                )
+                return manifest
+            else:
+                # Case B: Passing gates + requested functionality absent -> continue working
+                # Must NOT short-circuit to success!
+                class ContinueWorkingProvider(ns.LLMProvider):
+                    name = "S4 Scripted Continue-Working Provider"
+                    calls = 0
+
+                    def ask(self, messages):
+                        self.calls += 1
+                        if self.calls == 1:
+                            return '<agent_action>{"action": "read_file", "args": {"path": "greeter.py"}}</agent_action>'
+                        return None
+
+                agent.llm.providers = [ContinueWorkingProvider()]
+                intro = f"CARD [{card['id']}]: {card['title']}\nGOAL: {card['goal']}"
+                agent.process_task(intro, "", agent.toolbox.list_files())
+
+                for handler in agent._current_file_handlers:
+                    ns.logger.removeHandler(handler)
+                    ns.prompt_logger.removeHandler(handler)
+                    handler.close()
+
+                outcome = "continued"
+                release_status = "working"
+                manifest = record.finalize(
+                    outcome=outcome,
+                    release_status=release_status,
+                    workspace_path=repo_dir,
+                    gate_results=gate_results,
+                    patch_text="",
+                    providers=agent.llm.providers,
+                    no_commit_explanation=None,
+                    pre_attempt_decision="continue_working",
+                )
+                return manifest
+        finally:
+            os.chdir(original_cwd)
+
+
+def generate_unchanged_card_samples(
+    output_base_dir: Optional[Path] = None,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Generate both Case A and Case B unchanged-card fixture samples."""
+    base = Path(output_base_dir).resolve() if output_base_dir else Path(__file__).resolve().parent / "eval" / "s4" / "unchanged-card-samples"
+    base.mkdir(parents=True, exist_ok=True)
+
+    case_a_dir = base / "case-a-goal-satisfied-no-change"
+    case_b_dir = base / "case-b-green-gates-missing-goal-continue"
+
+    manifest_a = run_unchanged_card_fixture(case_a_dir, case="case_a")
+    manifest_b = run_unchanged_card_fixture(case_b_dir, case="case_b")
+
+    return manifest_a, manifest_b

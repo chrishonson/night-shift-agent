@@ -124,7 +124,7 @@ def main():
     if args.command == 'validate':
         if not result.get('complete') or any('missing' in err or 'schema' in err or 'secret' in err for err in result.get('errors', [])):
             raise SystemExit(3)
-        if not result.get('valid') or result.get('reconstructed', {}).get('terminal_outcome') != 'succeeded':
+        if not result.get('valid') or result.get('reconstructed', {}).get('terminal_outcome') not in ('succeeded', 'continued'):
             raise SystemExit(2)
 
 

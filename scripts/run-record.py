@@ -8,8 +8,10 @@ from pathlib import Path
 # Ensure repo root is on python path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from run_record import (
+    generate_unchanged_card_samples,
     review_run_record,
     run_bounded_fixture,
+    run_unchanged_card_fixture,
     validate_run_record,
 )
 
@@ -36,6 +38,15 @@ def main():
         help="Target directory for generated sample",
     )
 
+    # generate-unchanged-samples
+    unchanged_parser = sub.add_parser("generate-unchanged-samples", help="Generate unchanged-card fixture samples (Case A and Case B)")
+    unchanged_parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path(__file__).resolve().parents[1] / "eval/s4/unchanged-card-samples",
+        help="Target base directory for generated samples",
+    )
+
     args = parser.parse_args()
 
     if args.command == "generate-sample":
@@ -43,6 +54,14 @@ def main():
         print(f"Sample generated at: {args.output_dir}")
         print(f"Record ID: {manifest.get('record_id')}")
         print(f"Outcome: {manifest.get('execution_summary', {}).get('terminal_outcome')}")
+        sys.exit(0)
+
+    elif args.command == "generate-unchanged-samples":
+        manifest_a, manifest_b = generate_unchanged_card_samples(output_base_dir=args.output_dir)
+        print(f"Case A sample generated at: {args.output_dir / 'case-a-goal-satisfied-no-change'}")
+        print(f"  Outcome: {manifest_a.get('execution_summary', {}).get('terminal_outcome')}")
+        print(f"Case B sample generated at: {args.output_dir / 'case-b-green-gates-missing-goal-continue'}")
+        print(f"  Outcome: {manifest_b.get('execution_summary', {}).get('terminal_outcome')}")
         sys.exit(0)
 
     elif args.command == "review":
@@ -65,7 +84,7 @@ def main():
 
             if not result.get("complete") or any("missing" in err or "schema" in err or "secret" in err for err in result.get("errors", [])):
                 sys.exit(3)
-            elif not result.get("valid") or result.get("reconstructed", {}).get("terminal_outcome") != "succeeded":
+            elif not result.get("valid") or result.get("reconstructed", {}).get("terminal_outcome") not in ("succeeded", "continued"):
                 sys.exit(2)
             else:
                 sys.exit(0)

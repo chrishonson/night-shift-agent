@@ -234,7 +234,7 @@ class ContextCapture:
                 'all_passed': all_passed,
             })
 
-    def finish(self, outcome, release_status, patch=None, acceptance=None):
+    def finish(self, outcome, release_status, patch=None, acceptance=None, no_commit_explanation=None):
         if self.closed:
             return
         data = {
@@ -247,6 +247,8 @@ class ContextCapture:
         if self.mode == 'payload':
             data['final_patch'] = redact_text(patch) if patch is not None else None
             data['independent_acceptance'] = acceptance
+            if no_commit_explanation is not None:
+                data['no_commit_explanation'] = redact_text(no_commit_explanation)
         self.emit('trace_finalized', data, terminal=True)
         self.closed = True
         if self.stream:

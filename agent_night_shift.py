@@ -2171,6 +2171,77 @@ CRITICAL - DO NOT HALLUCINATE:
             return outcome, [], None, f"Task draft evidence: {evidence_path}; human acceptance pending"
         return "failed", [], None, "No valid task result evidence within draft attempt limit"
 
+    def check_preexisting_satisfaction(
+        self, card: dict, target_dir: Optional[Path] = None
+    ) -> tuple:
+        """Check whether the card goal is already satisfied before starting a coding attempt (Card #16).
+
+        Evaluates declared baseline gates first. If all gates pass, explicitly evaluates
+        the card goal and acceptance criteria against current workspace behavior.
+
+        Passing existing gates alone is insufficient. A no-change success requires
+        goal-specific evidence plus all required gates passing, recorded with an explicit
+        no-commit explanation. If the goal is not proved, continue normal execution.
+        Gate errors never imply success.
+
+        Returns:
+            (is_satisfied: bool, gate_results: list, acceptance_eval: dict, explanation: Optional[str])
+        """
+        target_path = Path(target_dir).resolve() if target_dir else self.project_dir
+        gate_ids = list(card.get("gate_ids") or [])
+        self.toolbox.target_gates = list(gate_ids)
+
+        # 1. Run declared gates as baseline
+        logger.info(f"🔍 Running baseline verification gates for card {card.get('id', 'unknown')}...")
+        self.toolbox.verify_build()
+        gate_results = list(self.toolbox.last_gate_results)
+
+        # If last_gate_results is empty, fall back to build_state
+        if not gate_results:
+            status = "passed" if self.build_state.build_passed else "failed"
+            gate_results = [{"gate_id": "baseline_build", "status": status, "duration_ms": 0}]
+
+        all_gates_passed = all(g.get("status") == "passed" for g in gate_results) if gate_results else False
+
+        # Gate errors never imply success
+        if not all_gates_passed:
+            logger.info("🔴 Baseline gates failed or errored; cannot satisfy without changes (gate errors never imply success).")
+            acceptance_eval = {
+                "evaluated": False,
+                "passed": False,
+                "reason": "Baseline gates failed or errored (gate errors never imply success)"
+            }
+            return False, gate_results, acceptance_eval, None
+
+        # 2. Baseline gates passed -> explicitly check card goal and acceptance criteria against current behavior
+        criteria = card.get("acceptance_criteria") or []
+        if not criteria:
+            logger.info("ℹ️ Baseline gates passed, but no goal-specific acceptance criteria defined to prove preexisting satisfaction.")
+            acceptance_eval = {
+                "evaluated": False,
+                "passed": False,
+                "reason": "Passing existing gates alone is insufficient; no goal-specific acceptance criteria declared"
+            }
+            return False, gate_results, acceptance_eval, None
+
+        from run_record import evaluate_criteria
+        acceptance_eval = evaluate_criteria(criteria, target_path, patch_text="", gate_results=gate_results)
+
+        if acceptance_eval.get("passed"):
+            explanation = (
+                "Goal already satisfied before coding attempt: all acceptance criteria "
+                "verified against current behavior and all required gates passed. No commit required."
+            )
+            logger.info(f"✅ Goal already satisfied before coding attempt: {explanation}")
+            return True, gate_results, acceptance_eval, explanation
+        else:
+            explanation = (
+                "Baseline gates passed, but requested functionality absent / acceptance criteria "
+                "not satisfied. Continuing normal execution."
+            )
+            logger.info(f"⚡ {explanation}")
+            return False, gate_results, acceptance_eval, explanation
+
     def execute_card(self, card: dict, run_id: str, heartbeat: LeaseHeartbeatWorker) -> tuple:
         """Execute a single claimed card. Returns (outcome, gate_results, artifacts, error_msg)."""
         card_id = card.get("id", "unknown")
@@ -2217,6 +2288,24 @@ CRITICAL - DO NOT HALLUCINATE:
                 branch = f"{BRANCH_PREFIX}/{card_id}"
                 self.run_cmd_quiet(f"git checkout -b {branch} 2>/dev/null || git checkout {branch}")
                 logger.info(f"🌿 Working on branch: {branch}")
+
+            # Card #16: Check whether goal is already satisfied before starting coding attempt
+            is_satisfied, gate_results, acceptance, explanation = self.check_preexisting_satisfaction(card, target_dir)
+            if self.llm.context_capture:
+                all_passed = all(g.get("status") == "passed" for g in gate_results) if gate_results else False
+                capture_call(self.llm.context_capture, "verification_finished", gate_results, all_passed)
+
+            if is_satisfied:
+                self._last_preexisting_acceptance = acceptance
+                logger.info(f"✅ Pre-attempt check satisfied: {explanation}")
+                artifacts = {
+                    "no_commit": True,
+                    "no_commit_reason": explanation,
+                    "branch": branch,
+                }
+                return "succeeded", gate_results, artifacts, explanation
+
+            logger.info("⚡ Goal not satisfied by preexisting behavior; proceeding with normal execution.")
 
             task_intro = f"CARD [{card_id}] ({kind.upper()}): {card.get('title')}\nGOAL: {card.get('goal')}"
 
@@ -2332,7 +2421,9 @@ CRITICAL - DO NOT HALLUCINATE:
             except Exception as e:
                 logger.error(f"❌ Failed to release card {card.get('id')}: {e}")
             finally:
-                capture_call(capture, "finish", outcome, release_status)
+                no_commit_expl = artifacts.get("no_commit_reason") if isinstance(artifacts, dict) else None
+                acceptance = getattr(self, "_last_preexisting_acceptance", None) if no_commit_expl else None
+                capture_call(capture, "finish", outcome, release_status, "", acceptance, no_commit_expl)
                 self.llm.context_capture = None
 
             runs_count += 1
