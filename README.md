@@ -319,7 +319,31 @@ This project explores **agentic CI/CD**—the idea that an AI agent can:
 
 *Built with [Gemini AI](https://ai.google.dev/) and [Claude AI](https://claude.ai/).*
 
+### Task-card drafts
+
+Control-plane `task` cards use a bounded draft/evidence path (at most three
+provider calls), separate from software's TDD and verification loop. This path
+uses only the supplied title and goal: it does not dispatch the coding toolbox,
+run builds, configure Git, commit, or push. Work requiring file inspection,
+research, device access, or other unavailable context must return `blocked`
+with a useful partial draft and explicit missing inputs. Supply relevant context
+in the card, or execute such work with a capable assistant directly.
+
+A valid result contains `status` (`complete` or `blocked`), the actual `result`,
+a nonempty `evidence` array, and an `unknowns` array. The worker persists these
+with the card/run identifiers to `.artifacts/tasks/<run_id>.json` before reporting
+success. Missing/malformed evidence or a persistence failure cannot succeed.
+This is model-produced draft evidence, not independent factual verification or
+human acceptance; the record explicitly sets `human_accepted` to false.
+
+The deployed control-plane artifact schema only supports Git fields, so the
+local evidence path is currently carried in the release's text `error`/note
+field, including for successful drafts. No fake commit or PR is generated.
+Evidence stays on the executing machine. Lease acquisition, heartbeat,
+abandonment and release use the same lifecycle as software cards.
+
 ## S4 context evidence
 
 Opt-in local context capture and a synthetic pruning-regression replay are
 available. See [capture boundaries, limitations and commands](docs/s4/context-capture.md).
+

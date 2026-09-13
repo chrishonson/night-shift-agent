@@ -76,6 +76,7 @@ ANTIGRAVITY_PRINT_TIMEOUT_S = 900
 DEFAULT_MODEL_OLLAMA = "deepseek-r1:32b"
 OLLAMA_BASE_URL = "http://localhost:11434/api/generate" 
 
+MAX_TASK_DRAFT_ATTEMPTS = 3
 MAX_ITERATIONS = 80
 MAX_RETRIES = 2
 MAX_CI_FIX_ATTEMPTS = 5
@@ -1981,6 +1982,85 @@ CRITICAL - DO NOT HALLUCINATE:
         
         return False
 
+    def execute_task_card(self, card: dict, run_id: str, heartbeat) -> tuple:
+        """Produce a local draft from supplied context, never dispatch coding tools.
+
+        Evidence is an inspectable model-produced artifact, not independent proof
+        or human acceptance. Tasks needing unavailable tools/input stay blocked.
+        """
+        messages = [
+            {"role": "system", "content": (
+                "Produce a private task draft using ONLY the supplied card context. "
+                "No tools are available: do not execute commands, modify projects, "
+                "publish, contact people, or claim external actions occurred. "
+                "Return one JSON object with status (complete or blocked), result "
+                "(the actual nonempty deliverable, not a completion assertion), "
+                "evidence (nonempty array describing the supplied basis and how "
+                "the draft addresses the goal), and unknowns (array of missing inputs). "
+                "Separate supplied facts from recommendations. If fulfilling the "
+                "goal requires missing context, research, tools or external actions, "
+                "return blocked with a useful partial draft and explicit unknowns. "
+                "Complete means only the requested draft is produced; it never "
+                "means human acceptance or real-world outcome."
+            )},
+            {"role": "user", "content": json.dumps({
+                "title": card.get("title"), "goal": card.get("goal")
+            })}
+        ]
+        for _ in range(MAX_TASK_DRAFT_ATTEMPTS):
+            if heartbeat.abandoned:
+                return "abandoned", [], None, "Card abandoned during task drafting"
+            response = self.llm.ask(messages)
+            if heartbeat.abandoned:
+                return "abandoned", [], None, "Card abandoned during task drafting"
+            try:
+                result = json.loads(response) if isinstance(response, str) else None
+                if not isinstance(result, dict):
+                    raise ValueError("Expected a JSON object")
+                if result.get("status") not in ("complete", "blocked"):
+                    raise ValueError("Missing task status")
+                if not isinstance(result.get("result"), str) or not result["result"].strip():
+                    raise ValueError("Missing deliverable")
+                for field in ("evidence", "unknowns"):
+                    values = result.get(field)
+                    if not isinstance(values, list) or any(
+                        not isinstance(v, str) or not v.strip() for v in values
+                    ):
+                        raise ValueError("Invalid evidence or unknowns")
+                if not result["evidence"]:
+                    raise ValueError("Missing result evidence")
+                if result["status"] == "blocked" and not result["unknowns"]:
+                    raise ValueError("Blocked draft must identify missing inputs")
+            except (ValueError, TypeError):
+                messages.append({"role": "user", "content": (
+                    "No valid result evidence received. Return the required JSON "
+                    "with the actual deliverable, evidence and unknowns."
+                )})
+                continue
+
+            # A server-issued run id names the artifact, never a model-provided path.
+            if not re.fullmatch(r"[A-Za-z0-9_-]+", run_id):
+                return "failed", [], None, "Invalid task evidence run id"
+            evidence_path = self.project_dir / ".artifacts" / "tasks" / f"{run_id}.json"
+            record = {**result, "card_id": card.get("id"), "run_id": run_id,
+                      "goal": card.get("goal"), "human_accepted": False,
+                      "evidence_kind": "model_draft_from_supplied_context"}
+            try:
+                evidence_path.parent.mkdir(parents=True, exist_ok=True)
+                # Exclusive creation prevents accidentally overwriting prior evidence.
+                with evidence_path.open("x", encoding="utf-8") as output:
+                    json.dump(record, output, indent=2, ensure_ascii=False)
+                    output.write("\n")
+            except OSError as exc:
+                return "failed", [], None, f"Cannot persist task evidence: {exc}"
+            if heartbeat.abandoned:
+                return "abandoned", [], None, f"Card abandoned; draft retained at {evidence_path}"
+            outcome = "succeeded" if result["status"] == "complete" else "blocked"
+            # The deployed artifacts schema only accepts git fields. Preserve the
+            # local evidence pointer in the run's existing textual note/error field.
+            return outcome, [], None, f"Task draft evidence: {evidence_path}; human acceptance pending"
+        return "failed", [], None, "No valid task result evidence within draft attempt limit"
+
     def execute_card(self, card: dict, run_id: str, heartbeat: LeaseHeartbeatWorker) -> tuple:
         """Execute a single claimed card. Returns (outcome, gate_results, artifacts, error_msg)."""
         card_id = card.get("id", "unknown")
@@ -1992,9 +2072,13 @@ CRITICAL - DO NOT HALLUCINATE:
         self.current_card = card
         self.toolbox.current_card_id = card_id
         self.toolbox.target_gates = list(gate_ids)
+        self.toolbox.last_gate_results = []
 
         # Set up logging keyed to this run_id (observability join key)
         self._setup_logging(run_id=run_id)
+
+        if kind == "task":
+            return self.execute_task_card(card, run_id, heartbeat)
 
         orig_cwd = Path.cwd()
         target_dir = self.project_dir
