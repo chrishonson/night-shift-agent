@@ -99,3 +99,4 @@ Saved to `.agent_logs/` in the target project:
 - **Context Pruning**: Drops oldest message pairs when context exceeds `MAX_CONTEXT_CHARS`
 - **CI Monitoring**: After PR creation, polls GitHub Actions and attempts auto-fix on failures
 - **Subprocess Safety**: All subprocess calls use `stdin=subprocess.DEVNULL` to prevent hanging
+- **Git Auth**: Remote URLs carry no token. `gh` gets `GITHUB_TOKEN`; `git` gets `GIT_ASKPASS` fed from the environment, with `credential.helper` cleared so the machine's `gh auth git-credential` cannot answer as the human account
