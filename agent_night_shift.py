@@ -39,6 +39,10 @@ load_dotenv()
 DEFAULT_CONTROL_PLANE_URL = "https://us-central1-my-brain-88870.cloudfunctions.net/controlPlaneMcp"
 DEFAULT_IDENTITY_ID = "night-shift-01"
 DEFAULT_LANE = "local"
+
+# Secret Manager
+DEFAULT_GCP_PROJECT = "my-brain-88870"
+DEFAULT_GH_TOKEN_SECRET = "gh-bot-token-agentnightshift"
 CONTROL_PLANE_POLL_INTERVAL_BASE = 45.0  # seconds
 CONTROL_PLANE_HEARTBEAT_INTERVAL = 60.0  # seconds
 
@@ -909,8 +913,10 @@ class Toolbox:
         logger.info(f"🤖 Executing: {command}")
         
         env = os.environ.copy()
-        if os.getenv("GH_BOT_TOKEN") and cmd_stripped.startswith("gh "):
-            env["GITHUB_TOKEN"] = os.getenv("GH_BOT_TOKEN")
+        if cmd_stripped.startswith("gh "):
+            gh_token = resolve_gh_token()
+            if gh_token:
+                env["GITHUB_TOKEN"] = gh_token
 
         try:
             result = self.exec_command(command, env=env)
@@ -1251,6 +1257,55 @@ def detect_mobile_repos(git_root: Optional[Union[Path, str]] = None) -> List[str
     return mobile_repos
 
 
+def access_secret(secret_name: str) -> Optional[str]:
+    """Read a Secret Manager version through gcloud. In-memory only: the value
+    is never persisted and never logged, so a failure reports the cause without
+    the payload."""
+    project_id = os.getenv("GOOGLE_CLOUD_PROJECT", DEFAULT_GCP_PROJECT)
+    cmd = ["gcloud", "secrets", "versions", "access", "latest",
+           f"--secret={secret_name}", f"--project={project_id}"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+    except Exception as e:
+        logger.debug(f"Secret Manager access for '{secret_name}' skipped/failed: {e}")
+        return None
+    if proc.returncode == 0 and proc.stdout.strip():
+        return proc.stdout.strip()
+    return None
+
+
+# Sentinel so that "resolved to nothing" is cached as firmly as a hit. Without
+# it, a host with no gcloud pays for a failed subprocess on every gh command.
+_UNRESOLVED = object()
+_gh_token_cache = _UNRESOLVED
+
+
+def reset_gh_token_cache():
+    global _gh_token_cache
+    _gh_token_cache = _UNRESOLVED
+
+
+def resolve_gh_token() -> Optional[str]:
+    """The bot PAT, from Secret Manager first and .env second.
+
+    Secret Manager leads deliberately. It is the copy that gets rotated, so a
+    stale GH_BOT_TOKEN left in a .env file must not outrank it. The env var
+    stays as the offline fallback and as the override for a host without
+    gcloud.
+    """
+    global _gh_token_cache
+    if _gh_token_cache is not _UNRESOLVED:
+        return _gh_token_cache
+
+    token = access_secret(os.getenv("GH_BOT_TOKEN_SECRET", DEFAULT_GH_TOKEN_SECRET))
+    if not token:
+        env_token = os.getenv("GH_BOT_TOKEN")
+        token = env_token.strip() if env_token and env_token.strip() else None
+
+    _gh_token_cache = token
+    return token
+
+
 class ControlPlaneClient:
     """Client for the control plane MCP server."""
     def __init__(self, base_url: str = None, token: str = None, identity_id: str = DEFAULT_IDENTITY_ID):
@@ -1261,23 +1316,13 @@ class ControlPlaneClient:
         self.request_id = 0
 
     def _resolve_token(self) -> Optional[str]:
-        # 1. Environment variable
+        # Environment first here, unlike the bot PAT: this token is per-identity
+        # and the env var is how one host runs as a different worker.
         token = os.getenv("CONTROL_PLANE_BEARER_TOKEN")
         if token and token.strip():
             return token.strip()
 
-        # 2. Secret Manager via gcloud (in-memory only, never persisted or logged)
-        secret_name = f"control-plane-{self.identity_id}"
-        project_id = os.getenv("GOOGLE_CLOUD_PROJECT", "my-brain-88870")
-        try:
-            cmd = ["gcloud", "secrets", "versions", "access", "latest", f"--secret={secret_name}", f"--project={project_id}"]
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-            if proc.returncode == 0 and proc.stdout.strip():
-                return proc.stdout.strip()
-        except Exception as e:
-            logger.debug(f"Secret Manager resolution skipped/failed: {e}")
-
-        return None
+        return access_secret(f"control-plane-{self.identity_id}")
 
     def call_tool(self, name: str, arguments: dict = None, timeout: int = 30) -> dict:
         if not self.token:
@@ -1434,7 +1479,7 @@ class NightShiftAgent:
         self.toolbox.control_plane = self.control_plane
         self.llm = ProviderManager()
         self.bot_username = os.getenv("BOT_USERNAME", "agentnightshift")
-        self.gh_token = os.getenv("GH_BOT_TOKEN")
+        self.gh_token = resolve_gh_token()
         self._current_file_handlers = []
     
         # Set up file logging in the project directory

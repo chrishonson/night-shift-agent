@@ -12,7 +12,7 @@ Night Shift Agent is a single-file autonomous coding agent (~1300 lines in `agen
 # Setup
 source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env  # Add GH_BOT_TOKEN
+cp .env.example .env  # Bot PAT comes from Secret Manager; see README
 
 # Run agent against a target project
 python agent_night_shift.py --project-dir /path/to/target
@@ -74,7 +74,7 @@ Providers are tried in order. On quota/rate limit errors, the agent switches to 
 
 | Variable | Required | Default |
 |----------|----------|---------|
-| `GH_BOT_TOKEN` | Yes | - |
+| `GH_BOT_TOKEN` | No | Secret Manager `gh-bot-token-agentnightshift` |
 | `BOT_USERNAME` | No | `agentnightshift` |
 | `PREFERRED_AGENT_MODEL` | No | `gemini-2.5-flash-lite` |
 | `OLLAMA_MODEL` | No | `deepseek-r1:32b` |
