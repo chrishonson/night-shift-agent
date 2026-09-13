@@ -83,6 +83,11 @@ def main():
     compare.add_argument('--baseline', type=Path, required=True)
     compare.add_argument('--candidate', type=Path, required=True)
     compare.add_argument('--out', type=Path, required=True)
+    val_sub = sub.add_parser('validate')
+    val_sub.add_argument('record', type=Path)
+    val_sub.add_argument('--json', action='store_true')
+    rev_sub = sub.add_parser('review')
+    rev_sub.add_argument('record', type=Path)
     args = parser.parse_args()
     # The legacy worker configures a stdout log handler at import time.
     # Keep the command's stdout machine-readable, including that first import.
@@ -96,6 +101,15 @@ def main():
             bundle, protocol = load_protocol(args.bundle, args.protocol)
             provider = LocalOllamaDecisionProvider(args.model, args.timeout)
             result = run_probes(bundle, protocol, provider, args.output_dir, args.repetitions)
+        elif args.command == 'validate':
+            from run_record import validate_run_record, review_run_record
+            result = validate_run_record(args.record)
+            if not args.json:
+                sys.stderr.write(review_run_record(args.record) + "\n")
+        elif args.command == 'review':
+            from run_record import review_run_record
+            print(review_run_record(args.record))
+            raise SystemExit(0)
         else:
             result = replay(args.output_dir) if args.command == 'replay' else summarize_trace(args.trace)
     print(json.dumps(result, indent=2))
@@ -106,6 +120,11 @@ def main():
         if summary['provider_error'] or summary['capture_gaps']:
             raise SystemExit(3)
         if summary['failed'] or summary['invalid_output']:
+            raise SystemExit(2)
+    if args.command == 'validate':
+        if not result.get('complete') or any('missing' in err or 'schema' in err or 'secret' in err for err in result.get('errors', [])):
+            raise SystemExit(3)
+        if not result.get('valid') or result.get('reconstructed', {}).get('terminal_outcome') != 'succeeded':
             raise SystemExit(2)
 
 

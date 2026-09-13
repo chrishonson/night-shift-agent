@@ -774,9 +774,11 @@ class ProviderManager:
             self._context_decision += 1
             decision_id = self._context_decision
             capture_call(self.context_capture, "assembled", prompt, provider, decision_id)
+            start_t = time.time()
             try:
                 result = provider.ask(prompt)
-                capture_call(self.context_capture, "provider_finished", decision_id, "returned" if result is not None else "empty")
+                duration_ms = int((time.time() - start_t) * 1000)
+                capture_call(self.context_capture, "provider_finished", decision_id, "returned" if result is not None else "empty", result, None, duration_ms)
                 if result is not None:
                     self.current_index = i
                     return result
@@ -789,8 +791,9 @@ class ProviderManager:
                 else:
                     logger.error("❌ All providers exhausted!")
                     return None
-            except QuotaExceededError:
-                capture_call(self.context_capture, "provider_finished", decision_id, "quota_error")
+            except QuotaExceededError as e:
+                duration_ms = int((time.time() - start_t) * 1000)
+                capture_call(self.context_capture, "provider_finished", decision_id, "quota_error", None, str(e), duration_ms)
                 logger.warning(f"🛑 {provider.name} Quota/Key Limit. Switching...")
                 next_i = (i + 1) % len(self.providers)
                 if next_i != start_index:  # Haven't looped back yet
@@ -800,7 +803,8 @@ class ProviderManager:
                     logger.error("❌ All providers exhausted!")
                     return None
             except Exception as e:
-                capture_call(self.context_capture, "provider_finished", decision_id, "error")
+                duration_ms = int((time.time() - start_t) * 1000)
+                capture_call(self.context_capture, "provider_finished", decision_id, "error", None, str(e), duration_ms)
                 logger.error(f"❌ Critical error in {provider.name}: {e}")
                 # Failover on crash too
                 next_i = (i + 1) % len(self.providers)
@@ -2011,7 +2015,17 @@ CRITICAL - DO NOT HALLUCINATE:
                     
                     if tool:
                         logger.info(f"🛠️ Tool: {tool}")
-                        output = self.toolbox.dispatch(tool, args)
+                        tool_start_t = time.time()
+                        tool_err = None
+                        try:
+                            output = self.toolbox.dispatch(tool, args)
+                        except Exception as e:
+                            tool_err = str(e)
+                            output = f"Tool execution error: {e}"
+                        tool_duration_ms = int((time.time() - tool_start_t) * 1000)
+                        capture_call(self.llm.context_capture, "tool_executed", tool, args, output, tool_err, tool_duration_ms)
+                        if tool in ("verify_build", "verify", "run_tests", "test"):
+                            capture_call(self.llm.context_capture, "verification_finished", self.toolbox.last_gate_results, self.build_state.build_passed)
                         messages.append({"role": "user", "content": f"TOOL OUTPUT ({tool}): {output}"})
 
                         if tool == "replace":
@@ -2046,6 +2060,7 @@ CRITICAL - DO NOT HALLUCINATE:
             if not tool_run and self.build_state.files_changed_since_success:
                 logger.info("🔍 No tool calls detected. Running auto-verification...")
                 build_output = self.toolbox.verify_build()
+                capture_call(self.llm.context_capture, "verification_finished", self.toolbox.last_gate_results, self.build_state.build_passed)
                 messages.append({"role": "user", "content": f"AUTO-VERIFICATION OUTPUT:\n{build_output}"})
                 
             # Build Failure Logic - only increment on actual build attempts

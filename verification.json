@@ -5,14 +5,14 @@
       "id": "worker_tests",
       "placement": ["local"],
       "commands": [
-        ".venv/bin/python -m pytest -q parts_tests --cov=agent_night_shift --cov=context_capture --cov=context_decision_eval --cov=board_reconciliation_eval --cov-fail-under=55"
+        ".venv/bin/python -m pytest -q parts_tests --cov=agent_night_shift --cov=context_capture --cov=context_decision_eval --cov=board_reconciliation_eval --cov=run_record --cov-fail-under=55"
       ]
     },
     {
       "id": "worker_syntax",
       "placement": ["local"],
       "commands": [
-        ".venv/bin/python -m py_compile agent_night_shift.py context_capture.py context_decision_eval.py board_reconciliation_eval.py scripts/context-eval.py"
+        ".venv/bin/python -m py_compile agent_night_shift.py context_capture.py context_decision_eval.py board_reconciliation_eval.py run_record.py scripts/context-eval.py scripts/run-record.py"
       ]
     },
     {
