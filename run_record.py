@@ -276,6 +276,8 @@ class RunRecord:
         providers: Optional[List[Any]] = None,
         no_commit_explanation: Optional[str] = None,
         pre_attempt_decision: Optional[str] = None,
+        stall_reason: Optional[str] = None,
+        error: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Finalize events, generate unified diff, evaluate acceptance, and write manifest."""
         ws = workspace_path or self.workspace_dir
@@ -404,7 +406,9 @@ class RunRecord:
             "real_model_evidence": {
                 "status": "unavailable" if self.evidence_class != EVIDENCE_CLASS_REAL_MODEL else "available",
                 "reason": (
-                    "no_real_model_run_for_card_16"
+                    "no_real_model_run_for_card_17"
+                    if "17" in str(self.card.get("id", "")) or "CARD-17" in str(self.output_dir) or "stall" in str(self.output_dir)
+                    else "no_real_model_run_for_card_16"
                     if "16" in str(self.card.get("id", "")) or "CARD-16" in str(self.output_dir) or "unchanged" in str(self.output_dir)
                     else "no_real_model_run_for_card_50"
                 ) if self.evidence_class != EVIDENCE_CLASS_REAL_MODEL else None,
@@ -442,6 +446,8 @@ class RunRecord:
                 "independent_acceptance": acceptance_eval,
                 "pre_attempt_decision": pre_attempt_decision,
                 "no_commit_explanation": no_commit_explanation,
+                "stall_reason": stall_reason,
+                "error": error or stall_reason,
                 "terminal_outcome": outcome,
                 "release_status": release_status,
                 "complete": complete,
@@ -561,6 +567,7 @@ def validate_run_record(path: Path) -> Dict[str, Any]:
     terminal_outcome = exec_summary.get("terminal_outcome")
     pre_attempt_decision = exec_summary.get("pre_attempt_decision")
     no_commit_explanation = exec_summary.get("no_commit_explanation")
+    stall_reason = exec_summary.get("stall_reason")
     patch_clean = not bool(patch_text.strip())
 
     # Offline corroboration of independent acceptance against patch/events
@@ -586,6 +593,11 @@ def validate_run_record(path: Path) -> Dict[str, Any]:
     if pre_attempt_decision == "continue_working" and terminal_outcome == "succeeded" and patch_clean:
         errors.append("Invalid short-circuit success: baseline gates passed but goal-specific acceptance criteria failed")
 
+    # Card #17: Stall without write validation rules:
+    if terminal_outcome == "blocked" and stall_reason:
+        if "without writing" not in stall_reason.lower():
+            errors.append("Stall outcome declared without required 'without writing' rationale in stall_reason")
+
     valid = len(errors) == 0
 
     return {
@@ -610,6 +622,8 @@ def validate_run_record(path: Path) -> Dict[str, Any]:
             "failover_attribution": exec_summary.get("failover_attribution", []),
             "pre_attempt_decision": pre_attempt_decision,
             "no_commit_explanation": no_commit_explanation,
+            "stall_reason": stall_reason,
+            "error": exec_summary.get("error"),
             "terminal_outcome": terminal_outcome,
             "release_status": exec_summary.get("release_status"),
         },
@@ -643,6 +657,8 @@ def review_run_record(path: Path) -> str:
         lines.append(f"Pre-Attempt Decision: {recon.get('pre_attempt_decision')}")
     if recon.get("no_commit_explanation"):
         lines.append(f"No-Commit Explanation: {recon.get('no_commit_explanation')}")
+    if recon.get("stall_reason"):
+        lines.append(f"Stall Reason    : {recon.get('stall_reason')}")
 
     lines.extend([
         "-" * 64,
@@ -1083,3 +1099,239 @@ def generate_unchanged_card_samples(
     manifest_b = run_unchanged_card_fixture(case_b_dir, case="case_b")
 
     return manifest_a, manifest_b
+
+
+def run_stall_fixture(
+    output_dir: Path,
+    case: str = "case_stall_blocked",
+    threshold: int = 25,
+) -> Dict[str, Any]:
+    """Execute scripted provider fixture for Card #17 stall-without-write evaluation.
+
+    case_stall_blocked: Explored threshold iterations without writing -> blocked
+    case_justified_no_change_succeeds: Goal already satisfied before attempt -> succeeds with no-commit explanation (#16 contract)
+    case_healthy_read_then_write: Many reads then writes and verifies -> succeeds
+    """
+    output_dir = Path(output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    original_cwd = Path.cwd()
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        repo_dir = Path(temp_dir) / "sample-greeter"
+        repo_dir.mkdir(parents=True, exist_ok=True)
+
+        greeter_py = repo_dir / "greeter.py"
+        test_greeter_py = repo_dir / "test_greeter.py"
+
+        if case == "case_justified_no_change_succeeds":
+            # Goal is already satisfied before any changes
+            greeter_py.write_text(
+                'def greet(name: str) -> str:\n'
+                '    return f"Hello, {name}!"\n'
+            )
+            test_greeter_py.write_text(
+                'from greeter import greet\n\n'
+                'def test_greet():\n'
+                '    assert greet("NightShift") == "Hello, NightShift!"\n'
+            )
+        else:
+            # Baseline repo where greet is NOT yet implemented
+            greeter_py.write_text(
+                'def greet(name: str) -> str:\n'
+                '    # TODO: implement\n'
+                '    return ""\n'
+            )
+            test_greeter_py.write_text(
+                'from greeter import greet\n\n'
+                'def test_greet():\n'
+                '    assert greet("NightShift") == "Hello, NightShift!"\n'
+            )
+
+        verification_json = repo_dir / "verification.json"
+        verification_json.write_text(json.dumps({
+            "version": 1,
+            "gates": [
+                {
+                    "id": "unit_tests",
+                    "placement": ["local"],
+                    "commands": [
+                        f"{sys.executable} -m pytest -q test_greeter.py"
+                    ]
+                }
+            ]
+        }, indent=2))
+
+        gitignore = repo_dir / ".gitignore"
+        gitignore.write_text(".agent_logs/\n__pycache__/\n*.pyc\n.pytest_cache/\n")
+
+        # Copy run-gate.py into repo_dir/scripts so Toolbox uses verification.json gates
+        scripts_dir = repo_dir / "scripts"
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        source_run_gate = Path(__file__).resolve().parent / "scripts" / "run-gate.py"
+        if source_run_gate.exists():
+            shutil.copy(source_run_gate, scripts_dir / "run-gate.py")
+
+        subprocess.run(["git", "init"], cwd=repo_dir, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "agentnightshift"], cwd=repo_dir, check=True)
+        subprocess.run(["git", "config", "user.email", "agentnightshift@gmail.com"], cwd=repo_dir, check=True)
+        subprocess.run(["git", "add", "."], cwd=repo_dir, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "initial commit"], cwd=repo_dir, check=True, capture_output=True)
+
+        card_id = {
+            "case_stall_blocked": "CARD-17-CASE-STALL",
+            "case_justified_no_change_succeeds": "CARD-17-CASE-NO-CHANGE",
+            "case_healthy_read_then_write": "CARD-17-CASE-HEALTHY",
+        }.get(case, "CARD-17-SAMPLE")
+
+        card = {
+            "id": card_id,
+            "title": "Implement greeting function",
+            "goal": "Implement greet(name: str) in greeter.py returning 'Hello, {name}!' and pass unit_tests",
+            "kind": "software",
+            "repo": "sample-greeter",
+            "gate_ids": ["unit_tests"],
+            "acceptance_criteria": [
+                {
+                    "id": "defines_greet",
+                    "description": "greeter.py defines function greet(name: str)",
+                    "type": "file_contains",
+                    "target": "greeter.py",
+                    "pattern": "def greet(",
+                },
+                {
+                    "id": "correct_greeting",
+                    "description": "greet('NightShift') returns 'Hello, NightShift!'",
+                    "type": "python_eval",
+                    "code": "from greeter import greet; assert greet('NightShift') == 'Hello, NightShift!'",
+                },
+                {
+                    "id": "gate_passed",
+                    "description": "verification gate unit_tests passed",
+                    "type": "gate_status",
+                    "gate_id": "unit_tests",
+                    "expected_status": "passed",
+                },
+            ],
+        }
+
+        record = RunRecord(
+            output_dir=output_dir,
+            card=card,
+            evidence_class=EVIDENCE_CLASS_SCRIPTED,
+            mode="payload",
+            workspace_dir=repo_dir,
+        )
+
+        try:
+            os.chdir(repo_dir)
+            agent = ns.NightShiftAgent(str(repo_dir), token="synthetic-unused-token")
+            agent.llm.context_capture = record.capture
+            agent.toolbox.target_gates = list(card.get("gate_ids") or [])
+            agent.stall_threshold = threshold
+            agent.iteration_delay = 0.0
+
+            # Card #16 Pre-attempt satisfaction check
+            is_satisfied, gate_results, acceptance, explanation = agent.check_preexisting_satisfaction(card, repo_dir)
+            all_passed = all(g.get("status") == "passed" for g in gate_results) if gate_results else False
+            record.capture.verification_finished(gate_results, all_passed)
+
+            if is_satisfied:
+                outcome = "succeeded"
+                release_status = "acknowledged"
+                manifest = record.finalize(
+                    outcome=outcome,
+                    release_status=release_status,
+                    workspace_path=repo_dir,
+                    gate_results=gate_results,
+                    patch_text="",
+                    no_commit_explanation=explanation,
+                    pre_attempt_decision="justified_no_change_completion",
+                )
+                return manifest
+
+            if case == "case_stall_blocked":
+                class StallExploreProvider(ns.LLMProvider):
+                    name = "S4 Scripted Stall Explorer"
+                    calls = 0
+
+                    def ask(self, messages):
+                        self.calls += 1
+                        return '<agent_action>{"action": "read_file", "args": {"path": "greeter.py"}}</agent_action>'
+
+                providers = [StallExploreProvider()]
+            elif case == "case_healthy_read_then_write":
+                class HealthyReadThenWriteProvider(ns.LLMProvider):
+                    name = "S4 Scripted Healthy Provider"
+                    calls = 0
+
+                    def ask(self, messages):
+                        self.calls += 1
+                        if self.calls <= 20:
+                            return '<agent_action>{"action": "read_file", "args": {"path": "greeter.py"}}</agent_action>'
+                        elif self.calls == 21:
+                            content = 'def greet(name: str) -> str:\n    return f"Hello, {name}!"\n'
+                            return f'<agent_action>{{"action": "write_file", "args": {{"path": "greeter.py", "content": {json.dumps(content)}}}}}</agent_action>'
+                        elif self.calls == 22:
+                            return '<agent_action>{"action": "verify_build", "args": {}}</agent_action>'
+                        return None
+
+                providers = [HealthyReadThenWriteProvider()]
+            else:
+                raise ValueError(f"Unknown case: {case}")
+
+            agent.llm.providers = providers
+            intro = f"CARD [{card['id']}]: {card['title']}\nGOAL: {card['goal']}"
+            success = agent.process_task(intro, "", agent.toolbox.list_files())
+
+            for handler in agent._current_file_handlers:
+                ns.logger.removeHandler(handler)
+                ns.prompt_logger.removeHandler(handler)
+                handler.close()
+
+            if success:
+                outcome = "succeeded"
+                release_status = "acknowledged"
+                stall_reason = None
+            elif agent.last_stall_reason:
+                outcome = "blocked"
+                release_status = "acknowledged"
+                stall_reason = agent.last_stall_reason
+            else:
+                outcome = "failed"
+                release_status = "unknown"
+                stall_reason = None
+
+            manifest = record.finalize(
+                outcome=outcome,
+                release_status=release_status,
+                workspace_path=repo_dir,
+                gate_results=agent.toolbox.last_gate_results,
+                providers=providers,
+                stall_reason=stall_reason,
+            )
+            return manifest
+        finally:
+            os.chdir(original_cwd)
+
+
+def generate_stall_samples(
+    output_base_dir: Optional[Path] = None,
+    threshold: int = 25,
+) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+    """Generate all three Card #17 fixture samples:
+    1. case-stall-blocked: explored threshold iterations without writing -> blocked
+    2. case-justified-no-change-succeeds: #16 path still succeeds with no-commit explanation
+    3. case-healthy-read-then-write: 20 reads then write and verify -> succeeds
+    """
+    base = Path(output_base_dir).resolve() if output_base_dir else Path(__file__).resolve().parent / "eval" / "s4" / "stall-without-write-samples"
+    base.mkdir(parents=True, exist_ok=True)
+
+    case_stall_dir = base / "case-stall-blocked"
+    case_no_change_dir = base / "case-justified-no-change-succeeds"
+    case_healthy_dir = base / "case-healthy-read-then-write"
+
+    manifest_stall = run_stall_fixture(case_stall_dir, case="case_stall_blocked", threshold=threshold)
+    manifest_no_change = run_stall_fixture(case_no_change_dir, case="case_justified_no_change_succeeds", threshold=threshold)
+    manifest_healthy = run_stall_fixture(case_healthy_dir, case="case_healthy_read_then_write", threshold=threshold)
+
+    return manifest_stall, manifest_no_change, manifest_healthy

@@ -24,6 +24,7 @@ import difflib
 import random
 import threading
 import tempfile
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict, Any, Union
@@ -92,6 +93,18 @@ MAX_TOOL_OUTPUT_CHARS = 50000  # 50KB max per tool output to prevent context exp
 REPLACE_STALL_THRESHOLD = 3
 REQUIRE_BUILD_VERIFICATION = True
 BRANCH_PREFIX = "nightshift"
+
+# Card #17: Threshold for aborting silent explore-forever runs without writes
+# Empirical justification: Successful cards completed in 30, 66, 29, and 29 iterations,
+# all writing well before iteration 25. Dead exploration runs burned 80 iterations
+# with zero writes and zero verify_build calls (accounting for 160 of 405 iterations, or 40%).
+# A threshold of 25 provides ample margin (>15-20 read/shell calls) for legitimate exploration
+# before writing, while aborting unrecoverable dead loops early to conserve budget.
+DEFAULT_STALL_WITHOUT_WRITE_THRESHOLD = 25
+STALL_WITHOUT_WRITE_THRESHOLD = int(
+    os.getenv("STALL_WITHOUT_WRITE_THRESHOLD", str(DEFAULT_STALL_WITHOUT_WRITE_THRESHOLD))
+)
+DEFAULT_ITERATION_DELAY = float(os.getenv("NIGHT_SHIFT_ITERATION_DELAY", "2.0"))
 
 PROTECTED_FILES = {
     "build.gradle.kts", "settings.gradle.kts", "gradle.properties", 
@@ -1535,6 +1548,9 @@ class NightShiftAgent:
         self.bot_username = os.getenv("BOT_USERNAME", "agentnightshift")
         self.gh_token = resolve_gh_token()
         self._current_file_handlers = []
+        self.stall_threshold = STALL_WITHOUT_WRITE_THRESHOLD
+        self.iteration_delay = DEFAULT_ITERATION_DELAY
+        self.last_stall_reason = None
     
         # Set up file logging in the project directory
         self._setup_logging()
@@ -1899,6 +1915,14 @@ CRITICAL - DO NOT HALLUCINATE:
         consecutive_failures = 0
         replace_repeat_counts = {}
 
+        # Card #17: Stall detection state
+        self.last_stall_reason = None
+        has_written = False
+        has_verified = False
+        tool_counts = Counter()
+        card_kind = (self.current_card.get("kind") if self.current_card else "software") or "software"
+        stall_detection_enabled = (card_kind == "software")
+
         last_provider_index = self.llm.current_index
         i = 0
         while i < MAX_ITERATIONS:
@@ -1910,6 +1934,7 @@ CRITICAL - DO NOT HALLUCINATE:
                 logger.info(f"🔄 Provider switched! Resetting iteration count to 1/{MAX_ITERATIONS}")
                 i = 0
                 last_provider_index = self.llm.current_index
+                tool_counts.clear()
             
             # Context Pruning: preserve system (0) and task (1), prune middle pairs
             before_pruning = list(messages) if self.llm.context_capture else None
@@ -2014,6 +2039,7 @@ CRITICAL - DO NOT HALLUCINATE:
                     if "file_path" in args: args["path"] = args.pop("file_path") 
                     
                     if tool:
+                        tool_counts[tool] += 1
                         logger.info(f"🛠️ Tool: {tool}")
                         tool_start_t = time.time()
                         tool_err = None
@@ -2027,6 +2053,14 @@ CRITICAL - DO NOT HALLUCINATE:
                         if tool in ("verify_build", "verify", "run_tests", "test"):
                             capture_call(self.llm.context_capture, "verification_finished", self.toolbox.last_gate_results, self.build_state.build_passed)
                         messages.append({"role": "user", "content": f"TOOL OUTPUT ({tool}): {output}"})
+
+                        # Card #17: Track writes and verification attempts
+                        if tool == "write_file" and not (str(output).startswith("Error") or str(output).startswith("ERROR")):
+                            has_written = True
+                        elif tool == "replace" and "successfully replaced text" in str(output).lower():
+                            has_written = True
+                        elif tool in ("verify_build", "verify"):
+                            has_verified = True
 
                         if tool == "replace":
                             target_path = args.get("path")
@@ -2081,14 +2115,38 @@ CRITICAL - DO NOT HALLUCINATE:
                 else:
                     consecutive_failures = 0
                 self.build_state.build_attempted = False
+
+            if len(self.build_state.files_changed_since_success) > 0:
+                has_written = True
+            if self.build_state.build_attempted:
+                has_verified = True
             
             # Check Success (Build Passed + User Task satisfied implies we should commit)
             if self.build_state.build_passed and self.build_state.is_verified():
                 logger.info("✅ Build Passed. Task Complete.")
                 return True
+
+            # Card #17: Abort silent explore-forever runs with no writes and no verification
+            if (
+                stall_detection_enabled
+                and (i + 1) >= self.stall_threshold
+                and not has_written
+                and not has_verified
+            ):
+                if tool_counts:
+                    breakdown_parts = [f"{count} {t}" for t, count in tool_counts.most_common()]
+                    tool_summary = ", ".join(breakdown_parts)
+                else:
+                    tool_summary = "0 tools executed"
+
+                stall_msg = f"Explored {i + 1} iterations without writing ({tool_summary})"
+                logger.warning(f"🛑 Stall detected: {stall_msg}")
+                self.last_stall_reason = stall_msg
+                return False
             
             i += 1
-            time.sleep(2)
+            if self.iteration_delay > 0:
+                time.sleep(self.iteration_delay)
         
         return False
 
@@ -2318,6 +2376,7 @@ CRITICAL - DO NOT HALLUCINATE:
                     logger.warning(f"Failed to read ARCHITECTURE.md: {e}")
 
             files = self.toolbox.list_files()
+            self.last_stall_reason = None
             task_success = self.process_task(task_intro, arch_output, files)
 
             if heartbeat.abandoned:
@@ -2333,6 +2392,9 @@ CRITICAL - DO NOT HALLUCINATE:
                     artifacts = {"branch": branch, "commit_sha": commit_sha}
 
                 return "succeeded", self.toolbox.last_gate_results, artifacts, None
+            elif self.last_stall_reason:
+                logger.warning(f"🛑 Releasing card {card_id} as blocked due to stall: {self.last_stall_reason}")
+                return "blocked", self.toolbox.last_gate_results, None, self.last_stall_reason
             else:
                 return "failed", self.toolbox.last_gate_results, None, "Verification failed or max iterations reached"
 
