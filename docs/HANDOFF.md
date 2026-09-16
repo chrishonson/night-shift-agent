@@ -30,14 +30,18 @@ a contract gets an error, not a guessed Gradle invocation. Operational detail
 
 ## Board
 
-- Deployed revision: `controlplanemcp-00022-fog`, updated 2026-09-14T14:42:23Z,
-  which postdates main `636fd89`. Local `control-plane` checkout is clean and level
-  with `origin/main`.
+- Deployed revision: `controlplanemcp-00023-nif`, released 2026-09-16T21:25:19Z
+  from local main `543f70d` (lane removal). Local main is 4 commits ahead of
+  `origin/main`: production is running code that has not been pushed.
+- `controlPlaneLeaseReaper` runs in production on a five-minute schedule, deployed
+  2026-09-08, but its source exists only on `checkpoint/mcp-query-token-wip`
+  (`1d84401`), not on main. The release above deployed `controlPlaneMcp` alone
+  specifically to avoid deleting it. Getting its source onto main is unfinished work.
 - Card feedback works in production on completed cards, verified by writing and
   reading back through the MCP tool and through `POST/GET /board/cards/:id/feedback`,
   the route the board UI calls.
 - Three local-only branches remain unmerged and are each explicitly dispositioned:
-  `agent/card-49-remove-lane` (deferred, see below), `agent/reconciliation-primitive-and-s4`
+  `agent/card-49-remove-lane` (now merged, see below), `agent/reconciliation-primitive-and-s4`
   at `0f52d34` (a `card_reconcile` MCP primitive with tests, never integrated),
   and `checkpoint/mcp-query-token-wip` at `1d84401` (a working-tree checkpoint kept
   during the card-52 reconcile, not a feature).
@@ -71,16 +75,12 @@ does not certify.
 
 ## Deliberately deferred
 
-- **Lane removal (card 49).** Implemented at `fcfbf09` on `agent/card-49-remove-lane`,
-  not merged and not deployed, so lanes are still visible in production. Merged onto
-  current main for verification at `bdf1801` on `integration/card-49-on-main`
-  (`/Users/nick/git/control-plane-card49`): clean merge, build and typecheck clean,
-  301 tests pass. The branch keeps `lane` optional on `card_claim` and `placement`
-  optional on cards, so a board deploy is backward compatible with the current
-  worker and does not require a simultaneous worker release. Two gaps before it
-  ships: the card detail dialog still renders a "Placement Lanes" section fed from
-  `card.placement`, so that branch alone does not remove lanes from view, and the
-  branch carries a stray `ROLLHOUT-card-49.md` beside `ROLLOUT-card-49.md`.
+- **Lane removal (card 49) shipped 2026-09-16**, after this handoff was first
+  written. Merged to control-plane main and deployed as `controlplanemcp-00023-nif`.
+  The deployed board no longer shows lanes anywhere, and `board_snapshot` has no
+  `lanes` block. `card_claim` still accepts an optional lane and `card_create` still
+  accepts an optional placement, so the supported worker needed no change and a
+  lane-sending claim was accepted after the release.
 - **Model-tier escalation (card 18).** Backlog. Its blockers (50, 17) are done, so
   it is merely unstarted, not stuck.
 - **Board observability routine (card 21)** and **flashy-card contact session (card 20)**.
