@@ -72,9 +72,15 @@ does not certify.
 ## Deliberately deferred
 
 - **Lane removal (card 49).** Implemented at `fcfbf09` on `agent/card-49-remove-lane`,
-  not merged and not deployed, because the live MCP still requires a placement. It
-  needs a board release and a matching worker release together. The branch also
-  carries a stray `ROLLHOUT-card-49.md` beside `ROLLOUT-card-49.md`.
+  not merged and not deployed, so lanes are still visible in production. Merged onto
+  current main for verification at `bdf1801` on `integration/card-49-on-main`
+  (`/Users/nick/git/control-plane-card49`): clean merge, build and typecheck clean,
+  301 tests pass. The branch keeps `lane` optional on `card_claim` and `placement`
+  optional on cards, so a board deploy is backward compatible with the current
+  worker and does not require a simultaneous worker release. Two gaps before it
+  ships: the card detail dialog still renders a "Placement Lanes" section fed from
+  `card.placement`, so that branch alone does not remove lanes from view, and the
+  branch carries a stray `ROLLHOUT-card-49.md` beside `ROLLOUT-card-49.md`.
 - **Model-tier escalation (card 18).** Backlog. Its blockers (50, 17) are done, so
   it is merely unstarted, not stuck.
 - **Board observability routine (card 21)** and **flashy-card contact session (card 20)**.
