@@ -767,10 +767,7 @@ class ProviderManager:
             self.providers = [headless[self.force_provider](), local]
         else:
             if self.force_provider:
-                logger.warning(
-                    f"⚠️ FORCE_PROVIDER={self.force_provider} is not a wired provider. "
-                    f"Wired: {', '.join(list(headless) + ['ollama'])}. Falling back to the default chain."
-                )
+                raise ValueError(f"Unknown FORCE_PROVIDER={self.force_provider}; choose ollama, antigravity, claude or gemini")
             self.providers = [headless[n]() for n in HEADLESS_ORDER] + [local]
 
         self.current_index = 0
@@ -976,7 +973,7 @@ class Toolbox:
     
     def list_files(self, path="."):
         files = []
-        ignore = {".git", ".gradle", ".idea", "build", ".kotlin", "node_modules", ".agent_logs"}
+        ignore = {".git", ".gradle", ".idea", "build", ".kotlin", "node_modules", ".agent_logs", ".agent_records"}
         for root, dirs, filenames in os.walk(path):
             dirs[:] = [d for d in dirs if d not in ignore and not d.startswith(".")]
             for f in filenames:
@@ -1045,10 +1042,14 @@ class Toolbox:
         if verification_file.exists() and run_gate_script.exists():
             # The card declares the gates it is judged by. Anything else makes
             # every TDD loop read red no matter what the tests actually did.
-            gate_id = self.target_gates[0] if self.target_gates else "quality"
-            test_cmd = f"python3 {run_gate_script} {gate_id}"
+            contract = json.loads(verification_file.read_text())
+            available = [g["id"] for g in contract.get("gates", [])]
+            if not available:
+                return "ERROR: Verification contract has no gates"
+            gate_id = self.target_gates[0] if self.target_gates else available[0]
+            test_cmd = f"{shlex.quote(sys.executable)} {shlex.quote(str(run_gate_script))} {shlex.quote(gate_id)}"
         else:
-            test_cmd = "./gradlew testDebugUnitTest"
+            return "ERROR: Target needs verification.json and scripts/run-gate.py"
         
         logger.info(f"🧪 Running tests: {test_cmd}")
         
@@ -1087,7 +1088,10 @@ class Toolbox:
                     gates_to_run.append(g["id"])
 
         if not gates_to_run:
-            gates_to_run = ["quality"]
+            self.build_state.build_attempted = True
+            self.build_state.build_passed = False
+            self.last_gate_results = []
+            return "ERROR: No eligible verification gates declared"
 
         self.last_gate_results = []
         all_passed = True
@@ -1096,7 +1100,7 @@ class Toolbox:
         for gate_id in gates_to_run:
             logger.info(f"🔍 Running contract gate: {gate_id}...")
             start_ms = int(time.time() * 1000)
-            cmd = f"python3 {run_gate_script} {gate_id}"
+            cmd = f"{shlex.quote(sys.executable)} {shlex.quote(str(run_gate_script))} {shlex.quote(gate_id)}"
             res = self.exec_command(cmd)
             duration_ms = int(time.time() * 1000) - start_ms
 
@@ -1131,33 +1135,6 @@ class Toolbox:
             combined_output = "\n\n".join(outputs)
             return f"❌ CONTRACT VERIFICATION FAILED\n\n{self._parse_and_contextualize_errors(combined_output)}"
 
-    def _verify_via_legacy(self) -> str:
-        VERIFICATION_CMD = "./gradlew assembleDebug :composeApp:linkDebugFrameworkIosSimulatorArm64 detekt testDebugUnitTest koverVerify"
-        logger.info(f"🔍 Running verification build: {VERIFICATION_CMD}")
-        
-        env = os.environ.copy()
-        try:
-            result = self.exec_command(VERIFICATION_CMD, env=env)
-            self.build_state.build_attempted = True
-            self.build_state.build_passed = (result.returncode == 0)
-            
-            output = result.stdout + result.stderr
-            logger.debug(f"Full Verification Output:\n{output}")
-            
-            if result.returncode == 0:
-                if len(output) > MAX_TOOL_OUTPUT_CHARS:
-                    output = output[-MAX_TOOL_OUTPUT_CHARS:]
-                logger.info("✅ Verification PASSED")
-                if self.build_state.files_changed_since_success:
-                    self.build_state.checkpoint(self.build_state.files_changed_since_success)
-                return f"✅ VERIFICATION PASSED (build + tests + coverage)\n\n{output}"
-            else:
-                logger.warning(f"❌ Verification FAILED (Exit {result.returncode})")
-                return f"❌ VERIFICATION FAILED (exit {result.returncode}):\n\n{self._parse_and_contextualize_errors(output)}"
-        except Exception as e:
-            logger.error(f"❌ Verification error: {e}")
-            return f"Error running verification: {e}"
-
     def verify_build(self) -> str:
         """Run the official verification build. Checks target repository contract first."""
         verification_file = self.project_dir / "verification.json"
@@ -1165,7 +1142,10 @@ class Toolbox:
 
         if verification_file.exists() and run_gate_script.exists():
             return self._verify_via_contract(verification_file, run_gate_script)
-        return self._verify_via_legacy()
+        self.build_state.build_attempted = True
+        self.build_state.build_passed = False
+        self.last_gate_results = []
+        return "ERROR: Target needs verification.json and scripts/run-gate.py; no implicit build commands"
 
     def decompose(self, children: list = None, **kwargs) -> str:
         if not self.control_plane or not self.current_card_id:
@@ -1621,202 +1601,19 @@ class NightShiftAgent:
             self.run_cmd_quiet(f'git config user.email "{self.bot_username}@users.noreply.github.com"')
             logger.info(f"✅ Authenticated for {repo}")
 
-    def create_branch(self):
-        # Check current branch
-        current = self.run_cmd_quiet("git branch --show-current").stdout.strip()
-        
-        # If already on a nightshift branch, reuse it
-        if current.startswith(BRANCH_PREFIX + "/"):
-            logger.info(f"🌿 Reusing existing branch: {current}")
-            return current
-        
-        # If on a feature branch (not main), stay on it and work there
-        if current and current != "main":
-            logger.info(f"🌿 Working on existing feature branch: {current}")
-            # Pull latest changes for this branch if it has a remote
-            pull_result = self.run_cmd_quiet(f"git pull origin {current} 2>/dev/null || true")
-            return current
-
-        # Only create new nightshift branch when on main
-        ts = datetime.now().strftime('%Y%m%d-%H%M%S')
-        branch = f"{BRANCH_PREFIX}/{ts}"
-        self.run_cmd_quiet("git checkout main")
-        self.run_cmd_quiet("git pull origin main")
-        self.run_cmd_quiet(f"git checkout -b {branch}")
-        logger.info(f"🌿 Created branch: {branch}")
-        return branch
-
     def commit_changes(self, task: str):
-        logger.info("📝 Committing changes...")
-        self.toolbox.run_shell("git add .")
-        
-        # Escape quotes in task name
-        safe_task = task.replace('"', '\\"')
-        commit_msg = f"Night Shift: {safe_task}"
-        
-        # Check if anything to commit
-        status = self.toolbox.run_shell("git status --porcelain")
-        if not status.strip():
-            logger.warning("⚠️ No changes to commit")
+        """Create a local review commit without shell interpolation or diagnostic files."""
+        args = {"cwd": self.project_dir, "capture_output": True, "text": True,
+                "timeout": 30, "stdin": subprocess.DEVNULL}
+        staged = subprocess.run(["git", "add", "--", ".", ":(exclude).agent_logs",
+                                 ":(exclude).agent_records"], **args)
+        if staged.returncode:
             return False
-            
-        result = self.toolbox.run_shell(f'git commit -m "{commit_msg}"')
-        if "Command failed" in result:
-             logger.error(f"❌ Failed to commit: {result}")
-             return False
-             
-        logger.info("✅ Changes committed")
-        return True
-
-    def push_and_create_pr(self, completed: list, branch: str) -> bool:
-        """Push branch and create PR. Returns True if PR was created/exists, False if no commits."""
-        logger.info(f"🚀 Pushing branch {branch}...")
-        push_result = self.toolbox.run_shell(f"git push -u origin {branch}")
-        
-        # Build nice PR title and body
-        tasks_succeeded = len(completed)
-        pr_title = f"🌙 Night Shift: {tasks_succeeded} task(s)"
-        task_list = "\n".join([f"- [x] {t}" for t in completed])
-        pr_body = f"## 🌙 Night Shift Agent Report\n\n**Tasks**: {tasks_succeeded}\n\n{task_list}"
-        
-        import tempfile
-        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.md') as f:
-            f.write(pr_body)
-            body_file = f.name
-
-        try:
-            pr_result = self.toolbox.run_shell(f'gh pr create --title "{pr_title}" --body-file "{body_file}" --head {branch} --base main')
-            logger.info("Compare URL: " + pr_result)
-        finally:
-            if os.path.exists(body_file):
-                os.unlink(body_file)
-        
-        # Check for "no commits" error - this means there's nothing to PR
-        if "No commits between" in pr_result:
-            logger.warning("⚠️ No new commits to create PR. All tasks may have been completed in previous runs.")
+        changed = subprocess.run(["git", "diff", "--cached", "--quiet"], **args)
+        if changed.returncode != 1:
             return False
-        
-        # Check if PR already exists (not an error)
-        if "already exists" in pr_result.lower():
-            logger.info("✅ PR already exists, will monitor existing PR.")
-            return True
-            
-        # Check for other errors
-        if "Command failed" in pr_result and "No commits between" not in pr_result:
-            logger.warning(f"⚠️ PR creation may have issues: {pr_result}")
-            return True
-            
-        return True
-
-    def monitor_pr(self, branch: str):
-        logger.info("\n" + "="*60)
-        logger.info(f"🔍 Monitoring CI Status for branch: {branch}")
-        logger.info("="*60)
-        
-        ci_passed = False
-        fix_attempts = 0
-        
-        for poll in range(MAX_CI_WAIT_POLLS):
-            logger.info(f"⏳ Poll {poll + 1}/{MAX_CI_WAIT_POLLS}: Waiting {CI_POLL_INTERVAL}s for CI...")
-            time.sleep(CI_POLL_INTERVAL)
-            
-            # Check PR status via GH CLI
-            cmd = f"gh pr view {branch} --json statusCheckRollup,state,mergeable --jq '{{state: .state, checks: .statusCheckRollup, mergeable: .mergeable}}'"
-            try:
-                output = self.toolbox.run_shell(cmd)
-                if "Command failed" in output:
-                    logger.warning("⚠️ Failed to check PR status (API error?)")
-                    continue
-
-                status_data = json.loads(output.strip())
-                state = status_data.get("state")
-                if state == "MERGED":
-                    logger.info("🎉 PR Merged! Stopping monitor.")
-                    ci_passed = True
-                    break
-                
-                checks = status_data.get("checks", [])
-                if not checks:
-                    logger.info("⏳ No checks reported yet...")
-                    continue
-            except Exception as e:
-                logger.warning(f"⚠️ Error parsing PR status: {e}")
-                
-            # Check Runs directly
-            run_cmd = f"gh run list --branch {branch} --limit 1 --json status,conclusion,databaseId --jq '.[0]'"
-            run_out = self.toolbox.run_shell(run_cmd)
-            if "Command failed" not in run_out and run_out.strip() != "null":
-                try:
-                    run_data = json.loads(run_out)
-                    status = run_data.get("status")         # queued, in_progress, completed
-                    conclusion = run_data.get("conclusion") # success, failure, cancelled
-                    run_id = run_data.get("databaseId")
-                    
-                    logger.info(f"   Run ID: {run_id} | Status: {status} | Conclusion: {conclusion}")
-                    
-                    if status == "completed":
-                        if conclusion == "success":
-                            logger.info("🎉 CI Checks Passed!")
-                            ci_passed = True
-                            break
-                        elif conclusion == "cancelled":
-                            logger.info("ℹ️ Run was cancelled (likely superseded by newer commit). Waiting for latest run...")
-                            continue
-                        elif conclusion in ["failure", "timed_out"]:
-                            if fix_attempts >= MAX_CI_FIX_ATTEMPTS:
-                                logger.error(f"❌ Max CI fix attempts ({MAX_CI_FIX_ATTEMPTS}) reached. Stopping monitor.")
-                                break
-                            fix_attempts += 1
-                            logger.error(f"❌ CI Failed (Run {run_id}, attempt {fix_attempts}/{MAX_CI_FIX_ATTEMPTS}). Initiating Auto-Fix...")
-                            if self.attempt_fix(branch, run_id):
-                                logger.info("✅ Auto-Fix applied and pushed. Resetting monitor...")
-                                continue 
-                            else:
-                                logger.error("❌ Auto-Fix failed. Stopping.")
-                                break
-                except Exception as e:
-                    logger.warning(f"Error parsing CI run status: {e}")
-
-        if ci_passed:
-            logger.info("✅ Monitoring complete: CI Passed.")
-        else:
-            logger.warning("⚠️ Monitoring ended: CI did not pass or timed out.")
-
-    def attempt_fix(self, branch: str, run_id: str) -> bool:
-        logger.info(f"🚑 Attempting Auto-Fix for Run {run_id}...")
-        
-        # 1. Fetch Logs
-        log_cmd = f"gh run view {run_id} --log-failed" 
-        logs = self.toolbox.run_shell(log_cmd)
-        
-        if len(logs) > 5000:
-            logs = logs[-5000:] # Truncate to last 5k chars of error
-            
-        fix_prompt = f"The CI build failed for branch {branch}. Here are the logs:\n\n{logs}\n\nPlease analyze the error and fix the code. Use 'read_file' to examine files if needed, and 'write_file' or 'replace' to fix the issue. Run verification build before finishing."
-        
-        # Reuse process_task logic but with new prompt foundation
-        # We treat "Fix CI Failure" as a task
-        arch_output = self.toolbox.run_shell("tree -L 2 -I 'build|.*' 2>/dev/null || find . -maxdepth 2 -type d ! -path '*/.*' ! -path './build*' 2>/dev/null | head -50")
-
-        arch_doc = self.project_dir / "docs" / "ARCHITECTURE.md"
-        if arch_doc.exists():
-            try:
-                arch_content = arch_doc.read_text()
-                arch_output = f"=== Directory Structure ===\n{arch_output}\n\n=== ARCHITECTURE.md ===\n{arch_content}"
-            except Exception as e:
-                logger.warning(f"Failed to read ARCHITECTURE.md: {e}")
-
-        files = self.toolbox.list_files()
-        if self.process_task(fix_prompt, arch_output, files):
-            # Commit and push the fix
-            if self.commit_changes("Fix CI Failure"):
-                self.toolbox.run_shell(f"git push origin {branch}")
-                logger.info("📤 CI fix pushed to remote.")
-                return True
-            else:
-                logger.warning("⚠️ No changes to commit after fix attempt.")
-                return False
-        return False
+        result = subprocess.run(["git", "commit", "-m", "Night Shift: " + task], **args)
+        return result.returncode == 0
 
     def process_task(self, task, context, files):
         self.build_state.reset()
@@ -1863,8 +1660,10 @@ AVAILABLE TOOLS (output as text, do not use native function calling):
 7. verify_build - Run full verification (build + tests + coverage) - REQUIRED before task completion
    Args: {{"action": "verify_build", "args": {{}}}}
    Returns: VERIFICATION PASSED or VERIFICATION FAILED with build output
-   NOTE: This runs assembleDebug, iOS framework build, detekt, tests, AND koverVerify.
+   NOTE: This runs the target repository verification.json gates.
          The task is NOT complete until this passes.
+
+LOCAL EXECUTION: Do not push, create PRs, deploy, or alter credentials. Return local changes for review.
 
 === TDD WORKFLOW (MANDATORY) ===
 
@@ -1894,9 +1693,9 @@ RULES:
 - NEVER use native function calling - output tool calls as plain text only
 - Output ONE tool call at a time wrapped in <agent_action> tags
 - Wait for tool output before making the next call
-- Tests go in: composeApp/src/commonTest/kotlin/... (mirror the main source structure)
+- Tests follow the target repository conventions; inspect existing tests first
 - You MUST call verify_build before considering the task complete
-- Coverage thresholds are enforced by koverVerify - ensure adequate test coverage
+- Preserve coverage thresholds declared by the target repository
 
 CRITICAL - DO NOT HALLUCINATE:
 - NEVER generate fake "USER:" or "TOOL OUTPUT:" text - you are NOT simulating a conversation
@@ -1931,8 +1730,7 @@ CRITICAL - DO NOT HALLUCINATE:
             # Check for silent provider switch (e.g. QuotaExceeded inside ask())
             # and reset iteration count if it happened to give new model a chance
             if self.llm.current_index != last_provider_index:
-                logger.info(f"🔄 Provider switched! Resetting iteration count to 1/{MAX_ITERATIONS}")
-                i = 0
+                logger.info("Provider switched; preserving the total task iteration limit")
                 last_provider_index = self.llm.current_index
                 tool_counts.clear()
             
@@ -2150,84 +1948,11 @@ CRITICAL - DO NOT HALLUCINATE:
         
         return False
 
-    def execute_task_card(self, card: dict, run_id: str, heartbeat) -> tuple:
-        """Produce a local draft from supplied context, never dispatch coding tools.
-
-        Evidence is an inspectable model-produced artifact, not independent proof
-        or human acceptance. Tasks needing unavailable tools/input stay blocked.
-        """
-        messages = [
-            {"role": "system", "content": (
-                "Produce a private task draft using ONLY the supplied card context. "
-                "No tools are available: do not execute commands, modify projects, "
-                "publish, contact people, or claim external actions occurred. "
-                "Return one JSON object with status (complete or blocked), result "
-                "(the actual nonempty deliverable, not a completion assertion), "
-                "evidence (nonempty array describing the supplied basis and how "
-                "the draft addresses the goal), and unknowns (array of missing inputs). "
-                "Separate supplied facts from recommendations. If fulfilling the "
-                "goal requires missing context, research, tools or external actions, "
-                "return blocked with a useful partial draft and explicit unknowns. "
-                "Complete means only the requested draft is produced; it never "
-                "means human acceptance or real-world outcome."
-            )},
-            {"role": "user", "content": json.dumps({
-                "title": card.get("title"), "goal": card.get("goal")
-            })}
-        ]
-        for _ in range(MAX_TASK_DRAFT_ATTEMPTS):
-            if heartbeat.abandoned:
-                return "abandoned", [], None, "Card abandoned during task drafting"
-            response = self.llm.ask(messages)
-            if heartbeat.abandoned:
-                return "abandoned", [], None, "Card abandoned during task drafting"
-            try:
-                result = json.loads(response) if isinstance(response, str) else None
-                if not isinstance(result, dict):
-                    raise ValueError("Expected a JSON object")
-                if result.get("status") not in ("complete", "blocked"):
-                    raise ValueError("Missing task status")
-                if not isinstance(result.get("result"), str) or not result["result"].strip():
-                    raise ValueError("Missing deliverable")
-                for field in ("evidence", "unknowns"):
-                    values = result.get(field)
-                    if not isinstance(values, list) or any(
-                        not isinstance(v, str) or not v.strip() for v in values
-                    ):
-                        raise ValueError("Invalid evidence or unknowns")
-                if not result["evidence"]:
-                    raise ValueError("Missing result evidence")
-                if result["status"] == "blocked" and not result["unknowns"]:
-                    raise ValueError("Blocked draft must identify missing inputs")
-            except (ValueError, TypeError):
-                messages.append({"role": "user", "content": (
-                    "No valid result evidence received. Return the required JSON "
-                    "with the actual deliverable, evidence and unknowns."
-                )})
-                continue
-
-            # A server-issued run id names the artifact, never a model-provided path.
-            if not re.fullmatch(r"[A-Za-z0-9_-]+", run_id):
-                return "failed", [], None, "Invalid task evidence run id"
-            evidence_path = self.project_dir / ".artifacts" / "tasks" / f"{run_id}.json"
-            record = {**result, "card_id": card.get("id"), "run_id": run_id,
-                      "goal": card.get("goal"), "human_accepted": False,
-                      "evidence_kind": "model_draft_from_supplied_context"}
-            try:
-                evidence_path.parent.mkdir(parents=True, exist_ok=True)
-                # Exclusive creation prevents accidentally overwriting prior evidence.
-                with evidence_path.open("x", encoding="utf-8") as output:
-                    json.dump(record, output, indent=2, ensure_ascii=False)
-                    output.write("\n")
-            except OSError as exc:
-                return "failed", [], None, f"Cannot persist task evidence: {exc}"
-            if heartbeat.abandoned:
-                return "abandoned", [], None, f"Card abandoned; draft retained at {evidence_path}"
-            outcome = "succeeded" if result["status"] == "complete" else "blocked"
-            # The deployed artifacts schema only accepts git fields. Preserve the
-            # local evidence pointer in the run's existing textual note/error field.
-            return outcome, [], None, f"Task draft evidence: {evidence_path}; human acceptance pending"
-        return "failed", [], None, "No valid task result evidence within draft attempt limit"
+    def execute_task_card(self, card, run_id, heartbeat):
+        """Non-software work belongs to a coordinator, not this coding worker."""
+        if heartbeat.abandoned:
+            return "abandoned", [], None, "Card abandoned before execution"
+        return "blocked", [], None, "Unsupported task kind: route non-software work to a coordinator"
 
     def check_preexisting_satisfaction(
         self, card: dict, target_dir: Optional[Path] = None
@@ -2316,22 +2041,16 @@ CRITICAL - DO NOT HALLUCINATE:
         # Set up logging keyed to this run_id (observability join key)
         self._setup_logging(run_id=run_id)
 
-        if kind == "task":
+        if kind != "software":
             return self.execute_task_card(card, run_id, heartbeat)
 
         orig_cwd = Path.cwd()
         target_dir = self.project_dir
 
-        if kind == "software" and repo_name:
-            potential_paths = [
-                Path.home() / "git" / repo_name,
-                self.project_dir / repo_name,
-                self.project_dir
-            ]
-            for p in potential_paths:
-                if p.exists() and (p / ".git").exists():
-                    target_dir = p
-                    break
+        if repo_name and Path(repo_name).name != self.project_dir.name:
+            return "blocked", [], None, "Card repository does not match explicit --project-dir"
+        if not gate_ids:
+            return "blocked", [], None, "Software cards require explicit verification gates"
 
         os.chdir(target_dir)
         self.toolbox.project_dir = target_dir
@@ -2344,7 +2063,7 @@ CRITICAL - DO NOT HALLUCINATE:
             if kind == "software" and (target_dir / ".git").exists():
                 self.configure_git()
                 branch = f"{BRANCH_PREFIX}/{card_id}"
-                self.run_cmd_quiet(f"git checkout -b {branch} 2>/dev/null || git checkout {branch}")
+                self.run_cmd_quiet(f"git checkout -b {shlex.quote(branch)} 2>/dev/null || git checkout {shlex.quote(branch)}")
                 logger.info(f"🌿 Working on branch: {branch}")
 
             # Card #16: Check whether goal is already satisfied before starting coding attempt
@@ -2388,7 +2107,6 @@ CRITICAL - DO NOT HALLUCINATE:
                 commit_sha = self.run_cmd_quiet("git rev-parse HEAD").stdout.strip() if commit_ok else None
 
                 if branch and commit_ok:
-                    push_res = self.toolbox.run_shell(f"git push -u origin {branch}")
                     artifacts = {"branch": branch, "commit_sha": commit_sha}
 
                 return "succeeded", self.toolbox.last_gate_results, artifacts, None
@@ -2411,10 +2129,14 @@ CRITICAL - DO NOT HALLUCINATE:
         repos: list = None
     ):
         """Control-plane mode: poll controlPlaneMcp for ready cards in lane, execute with heartbeats."""
-        if repos is None:
-            repos = detect_mobile_repos()
-            logger.info(f"📱 Auto-detected mobile repos: {repos}")
-        elif repos:
+        # An empty --repos is not "every repo": claiming unscoped would hand this
+        # worker task cards and other repositories' cards, which it cannot execute.
+        # An empty --repos is not "every repo": claiming unscoped would hand this
+        # worker task cards and other repositories' cards, which it cannot execute.
+        if not repos:
+            repos = [self.project_dir.name]
+            logger.info(f"Target repo: {repos}")
+        else:
             logger.info(f"🎯 Caller-specified repos: {repos}")
 
         logger.info(f"🎛️ Night Shift starting in control-plane mode (lane: {lane}, until_empty={until_empty})...")
@@ -2449,8 +2171,18 @@ CRITICAL - DO NOT HALLUCINATE:
             run_id = claim_result["run_id"]
             logger.info(f"🎯 Claimed card {card.get('id')}: '{card.get('title')}' (Run {run_id})")
 
-            capture_dir = os.getenv("S4_CONTEXT_CAPTURE_DIR")
-            capture = ContextCapture(capture_dir, card) if capture_dir else None
+            from run_record import RunRecord, EVIDENCE_CLASS_REAL_MODEL
+            import uuid
+            record_root = Path(os.getenv("NIGHT_SHIFT_RECORD_DIR", str(self.project_dir / ".agent_records")))
+            record = RunRecord(record_root / str(uuid.uuid4()), card,
+                               evidence_class=EVIDENCE_CLASS_REAL_MODEL,
+                               mode=os.getenv("NIGHT_SHIFT_CAPTURE_MODE", "metadata"),
+                               workspace_dir=self.project_dir)
+            capture = record.capture
+            self._last_patch = None
+            self._last_preexisting_acceptance = None
+            self.build_state = BuildState()
+            self.toolbox.build_state = self.build_state
             self.llm.context_capture = capture
             heartbeat = LeaseHeartbeatWorker(self.control_plane, run_id)
             heartbeat.start()
@@ -2476,7 +2208,8 @@ CRITICAL - DO NOT HALLUCINATE:
                     run_id=run_id,
                     outcome=outcome,
                     gates=gate_results,
-                    artifacts=artifacts,
+                    artifacts={k: v for k, v in (artifacts or {}).items()
+                               if k in ("branch", "commit_sha", "pr_url") and v is not None} or None,
                     error=error_msg
                 )
                 release_status = "acknowledged"
@@ -2485,69 +2218,17 @@ CRITICAL - DO NOT HALLUCINATE:
             finally:
                 no_commit_expl = artifacts.get("no_commit_reason") if isinstance(artifacts, dict) else None
                 acceptance = getattr(self, "_last_preexisting_acceptance", None) if no_commit_expl else None
-                capture_call(capture, "finish", outcome, release_status, "", acceptance, no_commit_expl)
-                self.llm.context_capture = None
+                try:
+                    record.finalize(outcome, release_status=release_status,
+                                    workspace_path=self.project_dir, gate_results=gate_results,
+                                    patch_text=self._last_patch, providers=self.llm.providers,
+                                    no_commit_explanation=no_commit_expl,
+                                    stall_reason=self.last_stall_reason, error=error_msg)
+                    logger.info(f"Run record: {record.output_dir}")
+                finally:
+                    self.llm.context_capture = None
 
             runs_count += 1
-
-    def run_file(self):
-        """Legacy mode: process tasks from local tasks.txt."""
-        logger.info(f"🚀 Starting Agent in file mode ({self.project_dir})")
-        self.configure_git()
-        
-        tasks_file = self.project_dir / "tasks.txt"
-        if not tasks_file.exists():
-            return
-            
-        with open(tasks_file) as f: all_tasks = [l.strip() for l in f if l.strip()]
-        if not all_tasks: return
-
-        branch = self.create_branch()
-        arch_output = self.toolbox.run_shell("tree -L 2 -I 'build|.*' 2>/dev/null || find . -maxdepth 2 -type d ! -path '*/.*' ! -path './build*' 2>/dev/null | head -50")
-        arch_doc = self.project_dir / "docs" / "ARCHITECTURE.md"
-        if arch_doc.exists():
-            try:
-                arch_output = f"=== Directory Structure ===\n{arch_output}\n\n=== ARCHITECTURE.md ===\n{arch_doc.read_text()}"
-            except Exception as e:
-                logger.warning(f"Failed to read ARCHITECTURE.md: {e}")
-        
-        files = self.toolbox.list_files()
-        completed_tasks = []
-        
-        for task in all_tasks:
-            if task.startswith("[x]"):
-                 completed_tasks.append(task.replace("[x]", "").replace("[!]", "").strip())
-
-        for task in all_tasks:
-            if task.startswith("[x]"): continue
-
-            logger.info(f"▶️ Processing: {task}")
-            clean_task = task.replace("[ ]", "").replace("[!]", "").strip()
-            if self.process_task(clean_task, arch_output, files):
-                try:
-                    if os.path.exists(tasks_file):
-                        current_content = open(tasks_file).read()
-                        new_content = current_content.replace(task, f"[x] {clean_task}", 1)
-                        open(tasks_file, "w").write(new_content)
-                        logger.info(f"✅ Marked task complete in tasks.txt: {clean_task}")
-                    else:
-                        with open(tasks_file, "w") as f:
-                            f.write(f"[x] {clean_task}\n")
-                except Exception as e:
-                    logger.error(f"❌ Failed to update tasks.txt: {e}")
-
-                self.commit_changes(clean_task)
-                completed_tasks.append(clean_task)
-
-        if self.commit_changes("Update task status"):
-             logger.info("✅ Committed pending task status updates")
-
-        if completed_tasks:
-            pr_created = self.push_and_create_pr(completed_tasks, branch)
-            if pr_created:
-                self.monitor_pr(branch)
-            else:
-                logger.info("✅ No PR to monitor. Agent complete.")
 
     def run(self, until_empty: bool = False, repos: list = None):
         """Default run entrypoint: takes work from the control plane."""
@@ -2556,22 +2237,15 @@ CRITICAL - DO NOT HALLUCINATE:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Night Shift Agent - Control Plane Worker")
     parser.add_argument('--project-dir', default='.', help="Working project directory")
-    parser.add_argument('--mode', choices=['control-plane', 'file'], default='control-plane', help="Where work comes from: 'control-plane' (the board) or 'file' (local tasks.txt)")
     parser.add_argument('--lane', default=DEFAULT_LANE, help="Control plane lane (default: local)")
     parser.add_argument('--max-runs', type=int, default=None, help="Max cards to process before exiting")
     parser.add_argument('--poll-interval', type=float, default=CONTROL_PLANE_POLL_INTERVAL_BASE, help="Base polling delay in seconds")
     parser.add_argument('--until-empty', action='store_true', default=False, help="Exit when no matching cards are claimable instead of polling indefinitely")
-    parser.add_argument('--repos', nargs='*', default=None, help="Explicit repos to scope to (defaults to auto-detecting mobile repos)")
+    parser.add_argument('--repos', nargs='*', default=None, help="Repos to claim (defaults to the explicitly selected project directory name)")
     args = parser.parse_args()
     
     agent = NightShiftAgent(args.project_dir)
-    if args.mode == "file":
-        agent.run_file()
-    else:
-        agent.run_control_plane(
-            lane=args.lane,
-            max_runs=args.max_runs,
-            poll_interval_base=args.poll_interval,
-            until_empty=args.until_empty,
-            repos=args.repos
-        )
+    agent.run_control_plane(
+        lane=args.lane, max_runs=args.max_runs,
+        poll_interval_base=args.poll_interval,
+        until_empty=args.until_empty, repos=args.repos)

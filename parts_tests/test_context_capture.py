@@ -91,20 +91,6 @@ def test_capture_bug_does_not_trigger_provider_failover(tmp_path):
     assert not summarize_trace(capture.path)['complete']
 
 
-def test_real_worker_replay_exposes_pruning_loss(tmp_path):
-    path = Path(__file__).resolve().parents[1] / 'scripts' / 'context-eval.py'
-    spec = importlib.util.spec_from_file_location('context_eval', path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    result = module.replay(tmp_path)
-    retained, pruned = result['results']
-    assert retained['required_source_at_final_boundary'] is True
-    assert pruned['required_source_at_final_boundary'] is False
-    assert retained['summary']['candidates'] == []
-    assert result['required_source_id'] in pruned['summary']['candidates'][0]['omitted_source_ids']
-    assert all(r['summary']['provider_calls'] == 3 and r['summary']['complete'] for r in result['results'])
-    assert result['real_model_run'] is False
-    assert result['agent_quality'] == 'not_evaluated'
 
 
 def test_report_rejects_mixed_or_reordered_events(tmp_path):
@@ -118,7 +104,7 @@ def test_report_rejects_mixed_or_reordered_events(tmp_path):
 
 @pytest.mark.parametrize('release_fails', [False, True])
 def test_control_plane_capture_finalizes_without_exporting_lease(tmp_path, monkeypatch, release_fails):
-    monkeypatch.setenv('S4_CONTEXT_CAPTURE_DIR', str(tmp_path / 'capture'))
+    monkeypatch.setenv('NIGHT_SHIFT_RECORD_DIR', str(tmp_path / 'capture'))
     original = Path.cwd()
     try:
         agent = ns.NightShiftAgent(str(tmp_path), token='secret-token')
@@ -133,7 +119,7 @@ def test_control_plane_capture_finalizes_without_exporting_lease(tmp_path, monke
 
         agent.control_plane.release = release
         agent.run_control_plane(max_runs=1)
-        trace = next((tmp_path / 'capture').glob('*.jsonl'))
+        trace = next((tmp_path / 'capture').glob('*/events.jsonl'))
         assert 'secret' not in trace.read_text()
         report = summarize_trace(trace)
         assert report['complete'] is True
@@ -144,7 +130,7 @@ def test_control_plane_capture_finalizes_without_exporting_lease(tmp_path, monke
 
 
 def test_capture_is_opt_in(tmp_path, monkeypatch):
-    monkeypatch.delenv('S4_CONTEXT_CAPTURE_DIR', raising=False)
+    monkeypatch.delenv('NIGHT_SHIFT_RECORD_DIR', raising=False)
     original = Path.cwd()
     try:
         agent = ns.NightShiftAgent(str(tmp_path), token='unused')
@@ -153,7 +139,7 @@ def test_capture_is_opt_in(tmp_path, monkeypatch):
         agent.control_plane.release = lambda **kw: {}
         agent.execute_card = lambda *args: ('failed', [], None, None)
         agent.run_control_plane(max_runs=1)
-        assert not list(tmp_path.glob('*.jsonl'))
+        assert not list(tmp_path.glob('*/events.jsonl'))
         assert agent.llm.context_capture is None
     finally:
         os.chdir(original)
@@ -165,13 +151,3 @@ def test_duplicate_message_omission_is_not_hidden(tmp_path):
     capture.transformed([message, message], [message], 100)
     capture.finish('failed', 'unknown')
     assert summarize_trace(capture.path)['candidates'][0]['omitted_source_ids'] == [digest(['user', 'same content'])]
-
-
-def test_cli_replay_stdout_is_json(tmp_path):
-    import subprocess
-    script = Path(__file__).resolve().parents[1] / 'scripts' / 'context-eval.py'
-    completed = subprocess.run([sys.executable, str(script), 'replay', '--output-dir', str(tmp_path)],
-                               capture_output=True, text=True, check=True)
-    result = json.loads(completed.stdout)
-    assert result['results'][0]['required_source_at_final_boundary'] is True
-    assert result['results'][1]['required_source_at_final_boundary'] is False

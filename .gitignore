@@ -37,3 +37,6 @@ Thumbs.db
 coverage.json
 htmlcov/
 .pytest_cache/
+
+# Local diagnostics, never task source
+.agent_records/

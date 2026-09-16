@@ -349,12 +349,10 @@ def test_a_pinned_headless_provider_still_keeps_local_underneath(monkeypatch):
     assert isinstance(pinned.providers[-1], ns.OllamaProvider)
 
 
-def test_an_unwired_force_provider_falls_back_to_the_default_chain(monkeypatch):
-    monkeypatch.setenv("FORCE_PROVIDER", "openrouter")
-    pinned = ns.ProviderManager()
-
-    assert isinstance(pinned.providers[0], ns.AntigravityCLIProvider)
-    assert isinstance(pinned.providers[-1], ns.OllamaProvider)
+def test_an_unwired_force_provider_fails_before_consuming_another_pool(monkeypatch):
+    monkeypatch.setenv("FORCE_PROVIDER", "misspelled-provider")
+    with pytest.raises(ValueError, match="Unknown FORCE_PROVIDER"):
+        ns.ProviderManager()
 
 
 def test_force_provider_pins_the_chain_to_local(monkeypatch):
@@ -594,7 +592,8 @@ def test_verification_defaults_to_quality_when_the_contract_places_nothing_local
 
     toolbox.verify_build()
 
-    assert gates_run(root) == ["quality"]
+    assert gates_run(root) == []
+    assert toolbox.build_state.build_passed is False
 
 
 def test_verification_checkpoints_the_files_that_passed(repo, tmp_path):
@@ -617,18 +616,6 @@ def test_a_malformed_contract_is_reported_not_raised(repo, tmp_path):
     assert "Error reading verification contract" in toolbox.verify_build()
 
 
-def test_a_repo_without_a_contract_uses_the_legacy_path(tmp_path, monkeypatch):
-    toolbox = ns.Toolbox(ns.BuildState(), project_dir=tmp_path)
-    called = {}
-
-    def legacy(self):
-        called["legacy"] = True
-        return "legacy verification ran"
-
-    monkeypatch.setattr(ns.Toolbox, "_verify_via_legacy", legacy)
-
-    assert toolbox.verify_build() == "legacy verification ran"
-    assert called["legacy"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -819,60 +806,14 @@ def forbid_coding(agent, monkeypatch):
         monkeypatch.setattr(agent.toolbox, name, forbidden)
 
 
-def test_task_saves_synthetic_evidence_without_coding(agent, monkeypatch):
-    forbid_coding(agent, monkeypatch)
-    agent.llm.ask = lambda messages: task_reply()
-    outcome, gates, artifacts, note = agent.execute_card(
-        {"id": "synthetic", "kind": "task", "goal": "Draft a synthetic two-step checklist."},
-        "task-run", StubLease())
-    assert (outcome, gates, artifacts) == ("succeeded", [], None)
-    saved = json.loads((agent.project_dir / ".artifacts/tasks/task-run.json").read_text())
-    assert saved["result"].startswith("Synthetic checklist:")
-    assert saved["human_accepted"] is False
-    assert saved["run_id"] == "task-run"
-    assert saved["card_id"] == "synthetic"
-    assert str(agent.project_dir / ".artifacts/tasks/task-run.json") in note
 
 
-@pytest.mark.parametrize("reply", [None, "done", "{}", task_reply(result=" "),
-                                   task_reply(evidence=[]), task_reply(evidence=[3])])
-def test_task_cannot_succeed_without_result_evidence(agent, monkeypatch, reply):
-    forbid_coding(agent, monkeypatch)
-    calls = []
-    agent.llm.ask = lambda messages: calls.append(1) or reply
-    outcome, gates, _, note = agent.execute_card(
-        {"id": "c", "kind": "task", "goal": "Draft a checklist"}, "missing", StubLease())
-    assert outcome == "failed"
-    assert gates == []
-    assert len(calls) <= ns.MAX_TASK_DRAFT_ATTEMPTS
-    assert not (agent.project_dir / ".artifacts/tasks/missing.json").exists()
 
 
-def test_task_missing_inputs_preserves_partial_evidence_as_blocked(agent, monkeypatch):
-    forbid_coding(agent, monkeypatch)
-    agent.llm.ask = lambda messages: task_reply("blocked", unknowns=["Current device readings"])
-    outcome, _, _, note = agent.execute_card(
-        {"id": "c", "kind": "task", "goal": "Inspect the device"}, "partial", StubLease())
-    assert outcome == "blocked"
-    assert "partial.json" in note
-    assert json.loads((agent.project_dir / ".artifacts/tasks/partial.json").read_text())["unknowns"]
 
 
-def test_task_abandonment_after_provider_prevents_success(agent, monkeypatch):
-    forbid_coding(agent, monkeypatch)
-    lease = StubLease()
-    def reply(messages):
-        lease.abandoned = True
-        return task_reply()
-    agent.llm.ask = reply
-    assert agent.execute_card({"id": "c", "kind": "task"}, "revoked", lease)[0] == "abandoned"
-    assert not (agent.project_dir / ".artifacts/tasks/revoked.json").exists()
 
 
-def test_task_evidence_write_failure_cannot_report_success(agent, monkeypatch):
-    agent.llm.ask = lambda messages: task_reply()
-    (agent.project_dir / ".artifacts").write_text("not a directory")
-    assert agent.execute_card({"id": "c", "kind": "task"}, "write-fails", StubLease())[0] == "failed"
 
 
 def test_software_still_enters_verification_loop(agent):
@@ -880,17 +821,3 @@ def test_software_still_enters_verification_loop(agent):
     agent.execute_task_card = lambda *args: pytest.fail("Software entered draft path")
     assert agent.execute_card({"id": "c", "kind": "software", "gate_ids": ["quality"]},
                               "software", StubLease())[0] == "failed"
-
-
-def test_task_worker_releases_persisted_evidence_through_shared_lifecycle(agent, wire, monkeypatch):
-    forbid_coding(agent, monkeypatch)
-    monkeypatch.setattr(agent, "detect_resources", lambda: [])
-    agent.llm.ask = lambda messages: task_reply()
-    stub = wire(card_claim={"card": {"id": "synthetic", "kind": "task", "goal": "Draft a synthetic checklist"},
-                            "run_id": "evidence-release"}, card_release={})
-    agent.run_control_plane(lane="local", max_runs=1, repos=["synthetic"])
-    release, = stub.args_for("card_release")
-    assert release["outcome"] == "succeeded"
-    assert release["gates"] == []
-    assert "evidence-release.json" in release["error"]
-    assert (agent.project_dir / ".artifacts/tasks/evidence-release.json").is_file()

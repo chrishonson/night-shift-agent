@@ -139,7 +139,7 @@ def test_stall_releases_blocked_not_failed(tmp_path):
         "title": "Stalling task",
         "goal": "Write code",
         "kind": "software",
-        "gate_ids": [],
+        "gate_ids": ["unit"],
     }
 
     class MockHeartbeat:
@@ -228,8 +228,8 @@ def test_software_vs_task_scoping(tmp_path):
     outcome, gates, artifacts, note = agent.execute_card(task_card, "run-task-1", MockHeartbeat())
 
     # Task card succeeds under task evidence contract without any code writes!
-    assert outcome == "succeeded"
-    assert "Task draft evidence" in note
+    assert outcome == "blocked"
+    assert "Unsupported task kind" in note
 
     # Also verify non-software kind inside process_task does not trigger write stall
     agent.current_card = {"kind": "planning"}

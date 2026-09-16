@@ -61,7 +61,7 @@ def evaluate_criteria(
     gate_results = gate_results or []
     gate_status_map = {g.get("gate_id"): g.get("status") for g in gate_results}
     evaluated_criteria = []
-    overall_passed = True
+    overall_passed = bool(criteria)
 
     for i, c in enumerate(criteria):
         c_id = f"criterion_{i+1}"
@@ -192,8 +192,8 @@ def evaluate_criteria(
         })
 
     return {
-        "evaluated": True,
-        "passed": overall_passed if criteria else True,
+        "evaluated": bool(criteria),
+        "passed": overall_passed,
         "criteria": evaluated_criteria,
     }
 
@@ -289,13 +289,13 @@ class RunRecord:
         if patch is None and ws and (ws / ".git").exists():
             try:
                 # Stage untracked with intent-to-add so diff covers new files
-                subprocess.run(["git", "add", "-N", "."], cwd=ws, capture_output=True, timeout=5)
+                subprocess.run(["git", "add", "-N", "--", ".", ":(exclude).agent_logs", ":(exclude).agent_records"], cwd=ws, capture_output=True, timeout=5)
                 diff_proc = subprocess.run(
-                    ["git", "diff", "HEAD"], cwd=ws, capture_output=True, text=True, timeout=5
+                    ["git", "diff", self.starting_commit if isinstance(self.starting_commit, str) else "HEAD", "--", ".", ":(exclude).agent_logs", ":(exclude).agent_records"], cwd=ws, capture_output=True, text=True, timeout=5
                 )
                 patch = diff_proc.stdout
                 stat_proc = subprocess.run(
-                    ["git", "diff", "--stat", "HEAD"], cwd=ws, capture_output=True, text=True, timeout=5
+                    ["git", "diff", "--stat", self.starting_commit if isinstance(self.starting_commit, str) else "HEAD", "--", ".", ":(exclude).agent_logs", ":(exclude).agent_records"], cwd=ws, capture_output=True, text=True, timeout=5
                 )
                 patch_stat = stat_proc.stdout.strip() or "0 files changed"
             except Exception as e:
