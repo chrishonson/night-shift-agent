@@ -1,4 +1,4 @@
-# Night Shift consolidation handoff — 2026-09-16
+# Night Shift consolidation handoff — updated 2026-09-17
 
 Consolidation is closed. What follows is everything needed to run the worker, find
 the evidence, and start the next piece of work without reconstructing branch history.
@@ -31,18 +31,22 @@ a contract gets an error, not a guessed Gradle invocation. Operational detail
 ## Board
 
 - Deployed revision: `controlplanemcp-00023-nif`, released 2026-09-16T21:25:19Z
-  from local main `543f70d` (lane removal). Local main is 4 commits ahead of
-  `origin/main`: production is running code that has not been pushed.
+  from local main `543f70d` (lane removal). Remote main was independently checked
+  on September 17 and remains `636fd89`. Publication is explicitly deferred under
+  the existing no-push constraint; this is local closure, not a claim of remote parity.
 - `controlPlaneLeaseReaper` runs in production on a five-minute schedule, deployed
-  2026-09-08, but its source exists only on `checkpoint/mcp-query-token-wip`
-  (`1d84401`), not on main. The release above deployed `controlPlaneMcp` alone
-  specifically to avoid deleting it. Getting its source onto main is unfinished work.
+  2026-09-08. Its scheduler export, ClaimService method, and REAP_LIMIT configuration
+  were restored from checkpoint `1d84401` to local main `649e1b2` during September 17 closeout,
+  preserving lane removal. Production already runs this function; no redeploy is
+  needed for source recovery. Build, typecheck, 306 unit tests and 373 full-suite
+  emulator tests pass, with 90.3% branch coverage. See
+  `/Users/nick/git/control-plane/docs/CONSOLIDATION-CLOSEOUT.md`.
 - Card feedback works in production on completed cards, verified by writing and
   reading back through the MCP tool and through `POST/GET /board/cards/:id/feedback`,
   the route the board UI calls.
-- Three local-only branches remain unmerged and are each explicitly dispositioned:
+- Historical branches are explicitly dispositioned:
   `agent/card-49-remove-lane` (now merged, see below), `agent/reconciliation-primitive-and-s4`
-  at `0f52d34` (a `card_reconcile` MCP primitive with tests, never integrated),
+  at `0f52d34` (optional `card_reconcile` primitive, deferred; not required for Study Coach),
   and `checkpoint/mcp-query-token-wip` at `1d84401` (a working-tree checkpoint kept
   during the card-52 reconcile, not a feature).
 
@@ -73,7 +77,7 @@ Task success and evidence capture are recorded separately in
 `smoke/meta/run-summary.json`. See `smoke/REVIEW.md` for what that run does and
 does not certify.
 
-## Deliberately deferred
+## Other work and dispositions
 
 - **Lane removal (card 49) shipped 2026-09-16**, after this handoff was first
   written. Merged to control-plane main and deployed as `controlplanemcp-00023-nif`.
@@ -92,8 +96,8 @@ does not certify.
 
 ## Known limitations
 
-- The feedback UI is verified at the API and served-markup level. No browser session
-  drove the form itself; Chrome computer-use permission was not granted.
+- Nick confirmed the feedback UI works. Independent readback on September 17 found
+  both admin comments on #57: `2vfXKkz90wwR6NqcUXan` and `OaFDijGo9yfWdxGDxAqr`.
 - The smoke run used a synthetic card through the real execution wiring, so
   production claim, heartbeat and release were not re-exercised on this branch.
 - `night-shift-01` is still scoped `repos: ["*"]` on the board. Scope is enforced
@@ -110,6 +114,9 @@ the board in `ready`. It is a coordinator-owned milestone: establish the product
 repository and its verification gates before decomposing software cards. Night Shift
 is optional for it, and the board can dispatch other coding agents just as well.
 
-The no-push, no-deployment constraint is still in force. Everything above was
-prepared and verified locally. Board data written during verification is limited to
-card feedback and one cleared dead blocker reference.
+The September 16 lane-removal release was deployed by the intervening work.
+September 17 closeout adds local source recovery and documentation only, with no
+push, deployment, credential rotation or production worker attempt. Publication of
+the consolidated worker and Control Board commits remains explicitly deferred.
+The live board readback has 56 cards: 4 backlog, 1 ready (#57), 0 claimed, 2 blocked,
+35 done and 14 abandoned. No further infrastructure work is required to begin #57.

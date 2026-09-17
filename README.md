@@ -10,7 +10,8 @@ This worker is not a general planning assistant, model-training system or evalua
 Use `/Users/nick/git/night-shift-supported`, branch `codex/night-shift-supported`.
 Older worktrees are evidence, not alternative launch locations. This branch starts
 from card-17's combined worker at `47a050f` and preserves cards 50 and 16.
-Lane removal is deliberately deferred until the deployed board interface is compatible.
+Lane removal shipped on Control Board on September 16. Its optional legacy inputs
+remain compatible with this worker.
 
 ## Install and verify
 

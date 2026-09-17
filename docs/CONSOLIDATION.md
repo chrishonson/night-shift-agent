@@ -31,8 +31,8 @@ This is consolidation, not a new training or evaluation project.
   implicit Gradle verification in the supported run path.
 - Board attempts now use the retained full run-record wrapper, with metadata capture
   by default and optional payload capture. Automatic GitHub publication/CI repair is removed.
-- Lane removal (#49) remains deferred: live MCP still requires a lane. Neither historical
-  branch is deleted, and the supported worker keeps the compatible client interface.
+- Lane removal (#49) shipped as `controlplanemcp-00023-nif` on September 16.
+  Optional legacy lane inputs remain compatible with the supported worker.
 - Board feedback is deployed. Live MCP exposes card_feedback_add/list, the served
   `/board` page carries the feedback UI, and writes persist on completed cards
   through both the MCP tool and the REST route the UI calls.
@@ -52,17 +52,15 @@ This is consolidation, not a new training or evaluation project.
 - [x] Verify one real-model run on the final combined version: succeeded in 118.9s
       on Ollama qwen3.8:27b, declared gate passed, independent acceptance exit 0,
       record complete and valid.
-- [x] Verify production feedback persistence and deployed revision: revision
-      `controlplanemcp-00022-fog` (2026-09-14T14:42:23Z) postdates main `636fd89`;
-      feedback written and read back on completed cards through both the MCP tool
-      and the REST route the board UI calls. Browser DOM interaction is still unverified.
+- [x] Verify production feedback persistence: Nick confirmed the browser UI works;
+      both admin test comments on #57 were independently read back on September 17.
+      Current board revision is `controlplanemcp-00023-nif`.
 - [x] Archive superseded board work, defer optional work, create Study Coach milestone.
 - [x] Commit supported version and write final handoff with exact evidence.
 
 ## Known limitations
 
-- Feedback UI verified at the API and served-markup level only. No browser session
-  drove the actual form; Chrome computer-use permission was not granted.
+- Browser interaction was verified by Nick; this agent independently verified persisted data.
 - Board claim, heartbeat and release were not exercised against production by the
   smoke run, which used a synthetic card through the same execution wiring.
 - The `night-shift-01` identity is still scoped `repos: ["*"]` board-side. The
@@ -71,4 +69,7 @@ This is consolidation, not a new training or evaluation project.
   requires an admin reseed, which mints a new token.
 - No KMP or Gradle target was exercised on the consolidated branch.
 
-No push, PR, deployment, credential rotation or production worker capture was performed.
+The September 16 continuation deployed lane removal. The September 17 closeout
+restores the existing production lease-reaper source to local Control Board main;
+it does not deploy or push. Publication remains explicitly deferred under the
+existing constraint. See HANDOFF.md for exact revisions and verification evidence.
