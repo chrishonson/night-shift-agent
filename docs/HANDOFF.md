@@ -1,5 +1,12 @@
 # Night Shift consolidation handoff — updated 2026-09-17
 
+Production release update (20:13 UTC): Nick authorized deployment of Control Board
+source `649e1b2`. Both functions updated successfully and are ACTIVE:
+`controlplanemcp-00024-feq`, `controlplaneleasereaper-00004-rox`.
+Post-release board and feedback HTTP/MCP checks passed. #57 is ready with no
+blockers, no lease and zero attempts; claimed count is zero. This supersedes the
+historical deployment-deferral statements below. Git publication is still deferred.
+
 Consolidation is closed. What follows is everything needed to run the worker, find
 the evidence, and start the next piece of work without reconstructing branch history.
 
