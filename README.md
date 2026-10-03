@@ -69,6 +69,36 @@ repeatedly consuming attempts. Inspect the record and diff before accepting a re
 A lost release acknowledgement is recorded as unknown; reconcile the board before
 retrying. Never overwrite prior records to make a failed attempt look successful.
 
+## Model tier escalation
+
+Off by default. Set `NIGHT_SHIFT_MODEL_LADDER` to a ladder of Antigravity models, lowest tier
+first, to retry a card on a stronger model after it uses its whole iteration budget:
+
+```sh
+NIGHT_SHIFT_MODEL_LADDER='{"antigravity": ["gemini-3.8-flash-high", "gemini-3.1-pro-high"]}'
+```
+
+- The first tier must be the configured `ANTIGRAVITY_MODEL`, so turning the ladder on never
+  changes what a first attempt runs on. Every model must appear in `agy models`. A ladder that
+  fails either check is not used, and each run record says why.
+- The previous attempt is read from the run records, newest first, matched on card id. A card
+  with no earlier attempt, and every independent card, starts at the first tier.
+- A failed attempt that ended on the iteration cap moves the card up one tier. At the top tier
+  it stays there, and the board's attempt limit ends the climb.
+- Any other failure keeps the tier: no provider response, an unhandled error, or a run that
+  failed on a model outside the ladder, such as the local fallback.
+- A card that stalled without writing is blocked and is never retried or escalated on its own.
+  Once an operator acts on the card after the stall, the next attempt moves up one tier.
+- A step into another vendor's model, for example from `gemini-` to `claude-`, draws on
+  another quota pool. It is refused unless `NIGHT_SHIFT_LADDER_ALLOW_POOL_CHANGE=1`.
+- Each manifest records `tier_decision` (provider, model, tier, decision, reason, prior
+  termination) when a ladder is set, and `execution_summary.termination_reason` always:
+  `completed`, `iteration_cap`, `stall_without_write`, `no_response` or `error`.
+
+A run that is still failing tests when it hits the cap ends as `iteration_cap`, because the
+worker keeps iterating until the cap. Failing tests inside the budget cannot be told apart
+from running out of it.
+
 ## Archived experiments
 
 Context decision probes, board-reconciliation benchmarks and frozen research datasets
