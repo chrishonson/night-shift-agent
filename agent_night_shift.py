@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple, Dict, Any, Union
 from dotenv import load_dotenv
 from context_capture import ContextCapture, capture_call
+import model_tier
 
 # =============================================================================
 # CONFIGURATION & CONSTANTS
@@ -737,6 +738,7 @@ class ProviderManager:
     def __init__(self):
         self.context_capture = None
         self._context_decision = 0
+        self._primary_default_model = None
         self.providers: List[LLMProvider] = []
         self.force_provider = os.getenv("FORCE_PROVIDER", "").lower().strip()
         if self.force_provider:
@@ -772,6 +774,27 @@ class ProviderManager:
 
         self.current_index = 0
         logger.info(f"🔌 Provider Chain: {[f'{p.name} [{p.kind}]' for p in self.providers]}")
+
+    def primary_provider_key(self) -> str:
+        """Which provider the chain tries first: antigravity, claude, gemini or ollama."""
+        primary = self.providers[0]
+        for key, cls in (("antigravity", AntigravityCLIProvider), ("claude", ClaudeCLIProvider),
+                         ("gemini", GeminiCLIProvider), ("ollama", OllamaProvider)):
+            if isinstance(primary, cls):
+                return key
+        return type(primary).__name__.lower()
+
+    def use_model(self, model: str):
+        """Run the first provider on `model` until reset_model(), so a tier choice covers one attempt."""
+        primary = self.providers[0]
+        if self._primary_default_model is None:
+            self._primary_default_model = primary.model
+        primary.model = model
+
+    def reset_model(self):
+        if self._primary_default_model is not None:
+            self.providers[0].model = self._primary_default_model
+            self._primary_default_model = None
 
     def ask(self, prompt: str) -> Optional[str]:
         # Start from the last working provider, not always from 0
@@ -1533,7 +1556,11 @@ class NightShiftAgent:
         self.stall_threshold = STALL_WITHOUT_WRITE_THRESHOLD
         self.iteration_delay = DEFAULT_ITERATION_DELAY
         self.last_stall_reason = None
-    
+        self.last_termination = None
+        self.tier_ladder = None
+        self.tier_ladder_error = None
+        self._load_tier_ladder()
+
         # Set up file logging in the project directory
         self._setup_logging()
 
@@ -1565,6 +1592,50 @@ class NightShiftAgent:
         self._current_file_handlers.append(prompt_handler)
         
         logger.info(f"📁 Logging to: {log_dir} ({tag})")
+
+    def _load_tier_ladder(self):
+        """Read the model ladder from configuration. A ladder that cannot be used is recorded, never fatal."""
+        try:
+            ladder = model_tier.load_ladder(os.environ)
+            if ladder is None:
+                return
+            if self.llm.primary_provider_key() != ladder.provider:
+                problems = [f"the first provider is {self.llm.primary_provider_key()} but the ladder is for {ladder.provider}"]
+            else:
+                problems = model_tier.ladder_problems(ladder, model_tier.agy_model_catalog)
+                default = self.llm.providers[0].model
+                if ladder.models[0] != default:
+                    problems.append(f"the first tier {ladder.models[0]} is not the configured default model {default}")
+        except model_tier.LadderConfigError as exc:
+            problems = [str(exc)]
+        if problems:
+            self.tier_ladder_error = "; ".join(problems)
+            logger.error(f"🪜 Model ladder not used: {self.tier_ladder_error}")
+            return
+        self.tier_ladder = ladder
+        logger.info(f"🪜 Model ladder: {' -> '.join(ladder.models)}")
+
+    def select_attempt_tier(self, card: dict, record_root: Path):
+        """Choose and apply the model tier for this attempt.
+
+        Returns None when no ladder is configured, otherwise the decision to put in the run record.
+        """
+        if self.tier_ladder is None:
+            if not self.tier_ladder_error:
+                return None
+            return model_tier.disabled(self.llm.primary_provider_key(), self.llm.providers[0].model, self.tier_ladder_error)
+        prior = model_tier.load_prior_attempt(record_root, card.get("id"))
+        authorized = model_tier.operator_authorized_retry(card.get("history"), self.control_plane.identity_id)
+        decision = model_tier.choose_tier(self.tier_ladder, prior, operator_authorized=authorized)
+        if decision.model != self.llm.providers[0].model:
+            # The provider's catalog can change while a worker runs, so check the one model about to be used.
+            single = model_tier.Ladder(decision.provider, [decision.model])
+            problems = model_tier.ladder_problems(single, model_tier.agy_model_catalog)
+            if problems:
+                return model_tier.disabled(decision.provider, self.llm.providers[0].model, "; ".join(problems))
+            self.llm.use_model(decision.model)
+        logger.info(f"🪜 Tier for card {card.get('id')}: {decision.decision} -> {decision.model} ({decision.reason})")
+        return decision
 
     def detect_resources(self) -> list:
         """Detect physical resources available on this host (e.g. attached Android device)."""
@@ -1619,6 +1690,7 @@ class NightShiftAgent:
 
     def process_task(self, task, context, files):
         self.build_state.reset()
+        self.last_termination = None
         system_prompt = f"""You are Night Shift Agent, an autonomous coding assistant that follows Test-Driven Development (TDD).
 
 IMPORTANT: This is a TEXT-ONLY interface. Do NOT use native function calling or built-in tools.
@@ -1751,7 +1823,9 @@ CRITICAL - DO NOT HALLUCINATE:
 
             # LLM Call with messages list
             response = self.llm.ask(messages)
-            if not response: return False
+            if not response:
+                self.last_termination = model_tier.TERMINATION_NO_RESPONSE
+                return False
             
             # Hallucination Detection: Strip fake USER/TOOL OUTPUT content
             # Some models (especially Gemini) hallucinate entire conversations
@@ -1924,6 +1998,7 @@ CRITICAL - DO NOT HALLUCINATE:
             # Check Success (Build Passed + User Task satisfied implies we should commit)
             if self.build_state.build_passed and self.build_state.is_verified():
                 logger.info("✅ Build Passed. Task Complete.")
+                self.last_termination = model_tier.TERMINATION_COMPLETED
                 return True
 
             # Card #17: Abort silent explore-forever runs with no writes and no verification
@@ -1942,12 +2017,14 @@ CRITICAL - DO NOT HALLUCINATE:
                 stall_msg = f"Explored {i + 1} iterations without writing ({tool_summary})"
                 logger.warning(f"🛑 Stall detected: {stall_msg}")
                 self.last_stall_reason = stall_msg
+                self.last_termination = model_tier.TERMINATION_STALL
                 return False
             
             i += 1
             if self.iteration_delay > 0:
                 time.sleep(self.iteration_delay)
-        
+
+        self.last_termination = model_tier.TERMINATION_ITERATION_CAP
         return False
 
     def execute_task_card(self, card, run_id, heartbeat):
@@ -2188,6 +2265,13 @@ CRITICAL - DO NOT HALLUCINATE:
             self.build_state = BuildState()
             self.toolbox.build_state = self.build_state
             self.llm.context_capture = capture
+            tier_decision = None
+            try:
+                tier_decision = self.select_attempt_tier(card, record_root)
+            except Exception as e:
+                # Choosing a tier is an optimization. It must never cost the card its attempt.
+                logger.error(f"🪜 Could not choose a model tier, using the default model: {e}")
+                self.llm.reset_model()
             heartbeat = LeaseHeartbeatWorker(self.control_plane, run_id)
             heartbeat.start()
 
@@ -2195,15 +2279,24 @@ CRITICAL - DO NOT HALLUCINATE:
             gate_results = []
             artifacts = None
             error_msg = None
+            self.last_termination = None
+            termination = None
 
             try:
                 outcome, gate_results, artifacts, error_msg = self.execute_card(card, run_id, heartbeat)
+                termination = self.last_termination
             except Exception as e:
                 logger.error(f"❌ Unhandled error executing card {card.get('id')}: {e}")
                 error_msg = str(e)
                 outcome = "failed"
+                termination = model_tier.TERMINATION_ERROR
             finally:
                 heartbeat.stop()
+            termination = termination or {
+                "succeeded": model_tier.TERMINATION_COMPLETED,
+                "abandoned": "abandoned",
+                "blocked": "not_attempted",
+            }.get(outcome, model_tier.TERMINATION_ERROR)
 
             release_status = "unknown"
             try:
@@ -2227,10 +2320,13 @@ CRITICAL - DO NOT HALLUCINATE:
                                     workspace_path=self.project_dir, gate_results=gate_results,
                                     patch_text=self._last_patch, providers=self.llm.providers,
                                     no_commit_explanation=no_commit_expl,
-                                    stall_reason=self.last_stall_reason, error=error_msg)
+                                    stall_reason=self.last_stall_reason, error=error_msg,
+                                    termination_reason=termination,
+                                    tier_decision=tier_decision.as_dict() if tier_decision else None)
                     logger.info(f"Run record: {record.output_dir}")
                 finally:
                     self.llm.context_capture = None
+                    self.llm.reset_model()
 
             runs_count += 1
 

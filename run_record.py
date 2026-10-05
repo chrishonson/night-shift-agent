@@ -278,6 +278,8 @@ class RunRecord:
         pre_attempt_decision: Optional[str] = None,
         stall_reason: Optional[str] = None,
         error: Optional[str] = None,
+        termination_reason: Optional[str] = None,
+        tier_decision: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Finalize events, generate unified diff, evaluate acceptance, and write manifest."""
         ws = workspace_path or self.workspace_dir
@@ -448,6 +450,7 @@ class RunRecord:
                 "no_commit_explanation": no_commit_explanation,
                 "stall_reason": stall_reason,
                 "error": error or stall_reason,
+                "termination_reason": termination_reason,
                 "terminal_outcome": outcome,
                 "release_status": release_status,
                 "complete": complete,
@@ -458,6 +461,9 @@ class RunRecord:
                 "final_patch_stat": patch_stat,
             },
         }
+
+        if tier_decision is not None:
+            manifest["tier_decision"] = tier_decision
 
         manifest_file = self.output_dir / "manifest.json"
         manifest_file.write_text(json.dumps(manifest, indent=2))
