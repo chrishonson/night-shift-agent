@@ -1,0 +1,122 @@
+{
+  "schema_version": "s4-run-record.v1",
+  "record_id": "cbf247de-0288-4650-bb85-f9a8b1ceeb99",
+  "trace_id": "4c228203-51c2-47cb-8486-c311365a1751",
+  "created_at_iso": "2026-09-13T23:29:56.940612+00:00",
+  "evidence_class": "scripted_provider_fixture",
+  "real_model_evidence": {
+    "status": "unavailable",
+    "reason": "no_real_model_run_for_card_16"
+  },
+  "mode": "payload",
+  "task": {
+    "id": "CARD-16-CASE-A",
+    "title": "Implement greeting function",
+    "goal": "Implement greet(name: str) in greeter.py returning 'Hello, {name}!' and pass unit_tests",
+    "kind": "software",
+    "repo": "sample-greeter",
+    "gate_ids": [
+      "unit_tests"
+    ],
+    "acceptance_criteria": [
+      {
+        "id": "defines_greet",
+        "description": "greeter.py defines function greet(name: str)",
+        "type": "file_contains",
+        "target": "greeter.py",
+        "pattern": "def greet("
+      },
+      {
+        "id": "correct_greeting",
+        "description": "greet('NightShift') returns 'Hello, NightShift!'",
+        "type": "python_eval",
+        "code": "from greeter import greet; assert greet('NightShift') == 'Hello, NightShift!'"
+      },
+      {
+        "id": "gate_passed",
+        "description": "verification gate unit_tests passed",
+        "type": "gate_status",
+        "gate_id": "unit_tests",
+        "expected_status": "passed"
+      }
+    ]
+  },
+  "environment": {
+    "starting_commit": "32f0e054f9a20831e07d792f1bb96b6fb2141baa",
+    "starting_dirty": false,
+    "untracked_files": [],
+    "branch": "main",
+    "harness_source_hash": "4e361d005892153eab10a9e09d0724b05306d0859c48194cd4ba4e40fccf74e4",
+    "python_version": "3.13.5",
+    "platform": "darwin"
+  },
+  "harness_configuration": {
+    "max_iterations": 80,
+    "max_context_chars": 80000,
+    "providers": [
+      {
+        "name": "scripted_provider",
+        "model": "none",
+        "kind": "fixture"
+      }
+    ],
+    "quota_reader": {
+      "status": "unavailable",
+      "reason": "deferred_offline"
+    }
+  },
+  "execution_summary": {
+    "iterations": 0,
+    "provider_attempts": [],
+    "failover_attribution": [],
+    "tool_calls": [],
+    "verification": {
+      "attempted": true,
+      "passed": true,
+      "gates": [
+        {
+          "gate_id": "unit_tests",
+          "status": "passed",
+          "duration_ms": 242
+        }
+      ]
+    },
+    "independent_acceptance": {
+      "evaluated": true,
+      "passed": true,
+      "criteria": [
+        {
+          "id": "defines_greet",
+          "description": "greeter.py defines function greet(name: str)",
+          "type": "file_contains",
+          "passed": true,
+          "detail": "Pattern 'def greet(' found in greeter.py"
+        },
+        {
+          "id": "correct_greeting",
+          "description": "greet('NightShift') returns 'Hello, NightShift!'",
+          "type": "python_eval",
+          "passed": true,
+          "detail": "Python assertion succeeded"
+        },
+        {
+          "id": "gate_passed",
+          "description": "verification gate unit_tests passed",
+          "type": "gate_status",
+          "passed": true,
+          "detail": "Gate 'unit_tests' status is 'passed'"
+        }
+      ]
+    },
+    "pre_attempt_decision": "justified_no_change_completion",
+    "no_commit_explanation": "Goal already satisfied before coding attempt: all acceptance criteria verified against current behavior and all required gates passed. No commit required.",
+    "terminal_outcome": "succeeded",
+    "release_status": "acknowledged",
+    "complete": true
+  },
+  "artifacts": {
+    "events": "events.jsonl",
+    "patch": "patch.diff",
+    "final_patch_stat": "none"
+  }
+}

@@ -1,0 +1,501 @@
+{
+  "schema_version": "s4-run-record.v1",
+  "record_id": "6ea38346-9810-4efd-a8a4-f11a2a3f472d",
+  "trace_id": "ea7c266d-c151-4a44-925a-35396e0366ff",
+  "created_at_iso": "2026-09-13T23:58:08.395546+00:00",
+  "evidence_class": "scripted_provider_fixture",
+  "real_model_evidence": {
+    "status": "unavailable",
+    "reason": "no_real_model_run_for_card_17"
+  },
+  "mode": "payload",
+  "task": {
+    "id": "CARD-17-CASE-STALL",
+    "title": "Implement greeting function",
+    "goal": "Implement greet(name: str) in greeter.py returning 'Hello, {name}!' and pass unit_tests",
+    "kind": "software",
+    "repo": "sample-greeter",
+    "gate_ids": [
+      "unit_tests"
+    ],
+    "acceptance_criteria": [
+      {
+        "id": "defines_greet",
+        "description": "greeter.py defines function greet(name: str)",
+        "type": "file_contains",
+        "target": "greeter.py",
+        "pattern": "def greet("
+      },
+      {
+        "id": "correct_greeting",
+        "description": "greet('NightShift') returns 'Hello, NightShift!'",
+        "type": "python_eval",
+        "code": "from greeter import greet; assert greet('NightShift') == 'Hello, NightShift!'"
+      },
+      {
+        "id": "gate_passed",
+        "description": "verification gate unit_tests passed",
+        "type": "gate_status",
+        "gate_id": "unit_tests",
+        "expected_status": "passed"
+      }
+    ]
+  },
+  "environment": {
+    "starting_commit": "8ea24b4c124a34897c81ce2573814b1e6a275d09",
+    "starting_dirty": false,
+    "untracked_files": [],
+    "branch": "main",
+    "harness_source_hash": "4f8bc5aecaf777c44dbecd57c9b897b77c821eab13dff09820c1a87d95450c17",
+    "python_version": "3.13.5",
+    "platform": "darwin"
+  },
+  "harness_configuration": {
+    "max_iterations": 80,
+    "max_context_chars": 80000,
+    "providers": [
+      {
+        "name": "S4 Scripted Stall Explorer",
+        "model": null,
+        "kind": "headless"
+      }
+    ],
+    "quota_reader": {
+      "status": "unavailable",
+      "reason": "deferred_offline"
+    }
+  },
+  "execution_summary": {
+    "iterations": 25,
+    "provider_attempts": [
+      {
+        "decision_id": 1,
+        "provider": "S4 Scripted Stall Explorer",
+        "status": "returned",
+        "duration_ms": 0
+      },
+      {
+        "decision_id": 2,
+        "provider": "S4 Scripted Stall Explorer",
+        "status": "returned",
+        "duration_ms": 0
+      },
+      {
+        "decision_id": 3,
+        "provider": "S4 Scripted Stall Explorer",
+        "status": "returned",
+        "duration_ms": 0
+      },
+      {
+        "decision_id": 4,
+        "provider": "S4 Scripted Stall Explorer",
+        "status": "returned",
+        "duration_ms": 0
+      },
+      {
+        "decision_id": 5,
+        "provider": "S4 Scripted Stall Explorer",
+        "status": "returned",
+        "duration_ms": 0
+      },
+      {
+        "decision_id": 6,
+        "provider": "S4 Scripted Stall Explorer",
+        "status": "returned",
+        "duration_ms": 0
+      },
+      {
+        "decision_id": 7,
+        "provider": "S4 Scripted Stall Explorer",
+        "status": "returned",
+        "duration_ms": 0
+      },
+      {
+        "decision_id": 8,
+        "provider": "S4 Scripted Stall Explorer",
+        "status": "returned",
+        "duration_ms": 0
+      },
+      {
+        "decision_id": 9,
+        "provider": "S4 Scripted Stall Explorer",
+        "status": "returned",
+        "duration_ms": 0
+      },
+      {
+        "decision_id": 10,
+        "provider": "S4 Scripted Stall Explorer",
+        "status": "returned",
+        "duration_ms": 0
+      },
+      {
+        "decision_id": 11,
+        "provider": "S4 Scripted Stall Explorer",
+        "status": "returned",
+        "duration_ms": 0
+      },
+      {
+        "decision_id": 12,
+        "provider": "S4 Scripted Stall Explorer",
+        "status": "returned",
+        "duration_ms": 0
+      },
+      {
+        "decision_id": 13,
+        "provider": "S4 Scripted Stall Explorer",
+        "status": "returned",
+        "duration_ms": 0
+      },
+      {
+        "decision_id": 14,
+        "provider": "S4 Scripted Stall Explorer",
+        "status": "returned",
+        "duration_ms": 0
+      },
+      {
+        "decision_id": 15,
+        "provider": "S4 Scripted Stall Explorer",
+        "status": "returned",
+        "duration_ms": 0
+      },
+      {
+        "decision_id": 16,
+        "provider": "S4 Scripted Stall Explorer",
+        "status": "returned",
+        "duration_ms": 0
+      },
+      {
+        "decision_id": 17,
+        "provider": "S4 Scripted Stall Explorer",
+        "status": "returned",
+        "duration_ms": 0
+      },
+      {
+        "decision_id": 18,
+        "provider": "S4 Scripted Stall Explorer",
+        "status": "returned",
+        "duration_ms": 0
+      },
+      {
+        "decision_id": 19,
+        "provider": "S4 Scripted Stall Explorer",
+        "status": "returned",
+        "duration_ms": 0
+      },
+      {
+        "decision_id": 20,
+        "provider": "S4 Scripted Stall Explorer",
+        "status": "returned",
+        "duration_ms": 0
+      },
+      {
+        "decision_id": 21,
+        "provider": "S4 Scripted Stall Explorer",
+        "status": "returned",
+        "duration_ms": 0
+      },
+      {
+        "decision_id": 22,
+        "provider": "S4 Scripted Stall Explorer",
+        "status": "returned",
+        "duration_ms": 0
+      },
+      {
+        "decision_id": 23,
+        "provider": "S4 Scripted Stall Explorer",
+        "status": "returned",
+        "duration_ms": 0
+      },
+      {
+        "decision_id": 24,
+        "provider": "S4 Scripted Stall Explorer",
+        "status": "returned",
+        "duration_ms": 0
+      },
+      {
+        "decision_id": 25,
+        "provider": "S4 Scripted Stall Explorer",
+        "status": "returned",
+        "duration_ms": 0
+      }
+    ],
+    "failover_attribution": [],
+    "tool_calls": [
+      {
+        "tool": "read_file",
+        "args": {
+          "path": "greeter.py"
+        },
+        "duration_ms": 0,
+        "status": "ok",
+        "output_chars": 65
+      },
+      {
+        "tool": "read_file",
+        "args": {
+          "path": "greeter.py"
+        },
+        "duration_ms": 0,
+        "status": "ok",
+        "output_chars": 65
+      },
+      {
+        "tool": "read_file",
+        "args": {
+          "path": "greeter.py"
+        },
+        "duration_ms": 0,
+        "status": "ok",
+        "output_chars": 65
+      },
+      {
+        "tool": "read_file",
+        "args": {
+          "path": "greeter.py"
+        },
+        "duration_ms": 0,
+        "status": "ok",
+        "output_chars": 65
+      },
+      {
+        "tool": "read_file",
+        "args": {
+          "path": "greeter.py"
+        },
+        "duration_ms": 0,
+        "status": "ok",
+        "output_chars": 65
+      },
+      {
+        "tool": "read_file",
+        "args": {
+          "path": "greeter.py"
+        },
+        "duration_ms": 0,
+        "status": "ok",
+        "output_chars": 65
+      },
+      {
+        "tool": "read_file",
+        "args": {
+          "path": "greeter.py"
+        },
+        "duration_ms": 0,
+        "status": "ok",
+        "output_chars": 65
+      },
+      {
+        "tool": "read_file",
+        "args": {
+          "path": "greeter.py"
+        },
+        "duration_ms": 0,
+        "status": "ok",
+        "output_chars": 65
+      },
+      {
+        "tool": "read_file",
+        "args": {
+          "path": "greeter.py"
+        },
+        "duration_ms": 0,
+        "status": "ok",
+        "output_chars": 65
+      },
+      {
+        "tool": "read_file",
+        "args": {
+          "path": "greeter.py"
+        },
+        "duration_ms": 0,
+        "status": "ok",
+        "output_chars": 65
+      },
+      {
+        "tool": "read_file",
+        "args": {
+          "path": "greeter.py"
+        },
+        "duration_ms": 0,
+        "status": "ok",
+        "output_chars": 65
+      },
+      {
+        "tool": "read_file",
+        "args": {
+          "path": "greeter.py"
+        },
+        "duration_ms": 0,
+        "status": "ok",
+        "output_chars": 65
+      },
+      {
+        "tool": "read_file",
+        "args": {
+          "path": "greeter.py"
+        },
+        "duration_ms": 0,
+        "status": "ok",
+        "output_chars": 65
+      },
+      {
+        "tool": "read_file",
+        "args": {
+          "path": "greeter.py"
+        },
+        "duration_ms": 0,
+        "status": "ok",
+        "output_chars": 65
+      },
+      {
+        "tool": "read_file",
+        "args": {
+          "path": "greeter.py"
+        },
+        "duration_ms": 0,
+        "status": "ok",
+        "output_chars": 65
+      },
+      {
+        "tool": "read_file",
+        "args": {
+          "path": "greeter.py"
+        },
+        "duration_ms": 0,
+        "status": "ok",
+        "output_chars": 65
+      },
+      {
+        "tool": "read_file",
+        "args": {
+          "path": "greeter.py"
+        },
+        "duration_ms": 0,
+        "status": "ok",
+        "output_chars": 65
+      },
+      {
+        "tool": "read_file",
+        "args": {
+          "path": "greeter.py"
+        },
+        "duration_ms": 0,
+        "status": "ok",
+        "output_chars": 65
+      },
+      {
+        "tool": "read_file",
+        "args": {
+          "path": "greeter.py"
+        },
+        "duration_ms": 0,
+        "status": "ok",
+        "output_chars": 65
+      },
+      {
+        "tool": "read_file",
+        "args": {
+          "path": "greeter.py"
+        },
+        "duration_ms": 0,
+        "status": "ok",
+        "output_chars": 65
+      },
+      {
+        "tool": "read_file",
+        "args": {
+          "path": "greeter.py"
+        },
+        "duration_ms": 0,
+        "status": "ok",
+        "output_chars": 65
+      },
+      {
+        "tool": "read_file",
+        "args": {
+          "path": "greeter.py"
+        },
+        "duration_ms": 0,
+        "status": "ok",
+        "output_chars": 65
+      },
+      {
+        "tool": "read_file",
+        "args": {
+          "path": "greeter.py"
+        },
+        "duration_ms": 0,
+        "status": "ok",
+        "output_chars": 65
+      },
+      {
+        "tool": "read_file",
+        "args": {
+          "path": "greeter.py"
+        },
+        "duration_ms": 0,
+        "status": "ok",
+        "output_chars": 65
+      },
+      {
+        "tool": "read_file",
+        "args": {
+          "path": "greeter.py"
+        },
+        "duration_ms": 0,
+        "status": "ok",
+        "output_chars": 65
+      }
+    ],
+    "verification": {
+      "attempted": true,
+      "passed": false,
+      "gates": [
+        {
+          "gate_id": "unit_tests",
+          "status": "failed",
+          "duration_ms": 253
+        }
+      ]
+    },
+    "independent_acceptance": {
+      "evaluated": true,
+      "passed": false,
+      "criteria": [
+        {
+          "id": "defines_greet",
+          "description": "greeter.py defines function greet(name: str)",
+          "type": "file_contains",
+          "passed": true,
+          "detail": "Pattern 'def greet(' found in greeter.py"
+        },
+        {
+          "id": "correct_greeting",
+          "description": "greet('NightShift') returns 'Hello, NightShift!'",
+          "type": "python_eval",
+          "passed": false,
+          "detail": "Python assertion failed: Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\n    from greeter import greet; assert greet('NightShift') == 'Hello, NightShift!'\n                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError"
+        },
+        {
+          "id": "gate_passed",
+          "description": "verification gate unit_tests passed",
+          "type": "gate_status",
+          "passed": false,
+          "detail": "Gate 'unit_tests' status 'failed' != expected 'passed'"
+        }
+      ]
+    },
+    "pre_attempt_decision": null,
+    "no_commit_explanation": null,
+    "stall_reason": "Explored 25 iterations without writing (25 read_file)",
+    "error": "Explored 25 iterations without writing (25 read_file)",
+    "terminal_outcome": "blocked",
+    "release_status": "acknowledged",
+    "complete": true
+  },
+  "artifacts": {
+    "events": "events.jsonl",
+    "patch": "patch.diff",
+    "final_patch_stat": "0 files changed"
+  }
+}

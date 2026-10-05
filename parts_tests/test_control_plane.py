@@ -349,12 +349,10 @@ def test_a_pinned_headless_provider_still_keeps_local_underneath(monkeypatch):
     assert isinstance(pinned.providers[-1], ns.OllamaProvider)
 
 
-def test_an_unwired_force_provider_falls_back_to_the_default_chain(monkeypatch):
-    monkeypatch.setenv("FORCE_PROVIDER", "openrouter")
-    pinned = ns.ProviderManager()
-
-    assert isinstance(pinned.providers[0], ns.AntigravityCLIProvider)
-    assert isinstance(pinned.providers[-1], ns.OllamaProvider)
+def test_an_unwired_force_provider_fails_before_consuming_another_pool(monkeypatch):
+    monkeypatch.setenv("FORCE_PROVIDER", "misspelled-provider")
+    with pytest.raises(ValueError, match="Unknown FORCE_PROVIDER"):
+        ns.ProviderManager()
 
 
 def test_force_provider_pins_the_chain_to_local(monkeypatch):
@@ -482,6 +480,7 @@ def test_execute_card_reports_abandoned_when_the_lease_was_revoked(agent):
 
 
 def test_execute_card_restores_the_working_directory(agent):
+    agent.llm.ask = lambda messages: None
     agent.process_task = lambda task, context, files: False
     before = os.getcwd()
 
@@ -491,6 +490,7 @@ def test_execute_card_restores_the_working_directory(agent):
 
 
 def test_execute_card_hands_the_cards_gates_to_the_toolbox(agent):
+    agent.llm.ask = lambda messages: None
     agent.process_task = lambda task, context, files: False
 
     agent.execute_card(
@@ -592,7 +592,8 @@ def test_verification_defaults_to_quality_when_the_contract_places_nothing_local
 
     toolbox.verify_build()
 
-    assert gates_run(root) == ["quality"]
+    assert gates_run(root) == []
+    assert toolbox.build_state.build_passed is False
 
 
 def test_verification_checkpoints_the_files_that_passed(repo, tmp_path):
@@ -615,18 +616,6 @@ def test_a_malformed_contract_is_reported_not_raised(repo, tmp_path):
     assert "Error reading verification contract" in toolbox.verify_build()
 
 
-def test_a_repo_without_a_contract_uses_the_legacy_path(tmp_path, monkeypatch):
-    toolbox = ns.Toolbox(ns.BuildState(), project_dir=tmp_path)
-    called = {}
-
-    def legacy(self):
-        called["legacy"] = True
-        return "legacy verification ran"
-
-    monkeypatch.setattr(ns.Toolbox, "_verify_via_legacy", legacy)
-
-    assert toolbox.verify_build() == "legacy verification ran"
-    assert called["legacy"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -755,3 +744,80 @@ def test_a_result_with_no_content_block_is_returned_as_is(plane):
         "jsonrpc": "2.0", "id": 1, "result": {"cards": [], "generated_at": "now"}
     }))
     assert client.snapshot() == {"cards": [], "generated_at": "now"}
+
+
+def test_client_claim_passes_repos(plane):
+    stub, client = plane(card_claim={"claimed": None})
+    res = client.claim(lane="local", repos=["flashy-card", "level-monitor"])
+    assert res is None
+    assert stub.calls[-1] == ("card_claim", {"lane": "local", "repos": ["flashy-card", "level-monitor"]})
+
+
+def test_detect_mobile_repos_identifies_mobile_projects(tmp_path):
+    # Setup directories
+    (tmp_path / "app-kts").mkdir()
+    (tmp_path / "app-kts" / ".git").mkdir()
+    (tmp_path / "app-kts" / "settings.gradle.kts").write_text("rootProject.name = 'app-kts'")
+
+    (tmp_path / "app-props").mkdir()
+    (tmp_path / "app-props" / ".git").mkdir()
+    (tmp_path / "app-props" / "local.properties").write_text("sdk.dir=/path/to/sdk")
+
+    (tmp_path / "app-manifest").mkdir()
+    (tmp_path / "app-manifest" / ".git").mkdir()
+    (tmp_path / "app-manifest" / "app" / "src" / "main").mkdir(parents=True)
+    (tmp_path / "app-manifest" / "app" / "src" / "main" / "AndroidManifest.xml").write_text("<manifest/>")
+
+    (tmp_path / "non-mobile").mkdir()
+    (tmp_path / "non-mobile" / ".git").mkdir()
+    (tmp_path / "non-mobile" / "package.json").write_text("{}")
+
+    (tmp_path / "non-git-mobile").mkdir()
+    (tmp_path / "non-git-mobile" / "settings.gradle.kts").write_text("rootProject.name = 'non-git'")
+
+    detected = ns.detect_mobile_repos(git_root=tmp_path)
+    assert detected == ["app-kts", "app-manifest", "app-props"]
+
+
+def test_run_control_plane_until_empty_exits_when_no_cards(agent, wire):
+    stub = wire(card_claim={"claimed": None})
+    agent.run_control_plane(lane="local", until_empty=True, repos=["flashy-card"])
+    assert stub.count("card_claim") == 1
+    call_args = stub.calls[0][1]
+    assert call_args["lane"] == "local"
+    assert call_args["repos"] == ["flashy-card"]
+
+
+# Task drafts use the same lease lifecycle, with a separate evidence contract.
+def task_reply(status="complete", **changes):
+    result = {"status": status, "result": "Synthetic checklist: inspect the demo, record the result.",
+              "evidence": ["The supplied goal asks for a synthetic two-step checklist."],
+              "unknowns": []}
+    result.update(changes)
+    return json.dumps(result)
+
+
+def forbid_coding(agent, monkeypatch):
+    def forbidden(*args, **kwargs):
+        pytest.fail("Task draft entered a coding/build/git tool")
+    for name in ("process_task", "commit_changes", "configure_git", "run_cmd_quiet"):
+        monkeypatch.setattr(agent, name, forbidden)
+    for name in ("run_shell", "list_files", "verify_build", "write_file"):
+        monkeypatch.setattr(agent.toolbox, name, forbidden)
+
+
+
+
+
+
+
+
+
+
+
+
+def test_software_still_enters_verification_loop(agent):
+    agent.process_task = lambda *args: False
+    agent.execute_task_card = lambda *args: pytest.fail("Software entered draft path")
+    assert agent.execute_card({"id": "c", "kind": "software", "gate_ids": ["quality"]},
+                              "software", StubLease())[0] == "failed"

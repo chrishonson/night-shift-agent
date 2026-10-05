@@ -5,6 +5,7 @@ __pycache__/
 *.so
 .Python
 .venv/
+.venv
 venv/
 ENV/
 
@@ -36,3 +37,6 @@ Thumbs.db
 coverage.json
 htmlcov/
 .pytest_cache/
+
+# Local diagnostics, never task source
+.agent_records/

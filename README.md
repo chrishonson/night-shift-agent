@@ -1,307 +1,81 @@
-# Night Shift Agent v3.6
+# Night Shift: local coding worker
 
-> **An AI-powered autonomous coding assistant that works while you sleep.**
+Night Shift takes a bounded software task, edits an explicitly selected repository,
+runs its verification contract, and returns local changes with diagnostic evidence.
+The coordinator owns planning, task selection, human review, publication and deployment.
+This worker is not a general planning assistant, model-training system or evaluation platform.
 
-Night Shift Agent is a Python-based autonomous coding agent powered by **Gemini AI** (with automatic failover to Claude, OpenRouter, and Ollama). It reads a task list, writes code, verifies builds, creates pull requests, and monitors CI—all without human intervention.
+## Supported local version
 
-## Why Night Shift?
+Use `/Users/nick/git/night-shift-supported`, branch `codex/night-shift-supported`.
+Older worktrees are evidence, not alternative launch locations. This branch starts
+from card-17's combined worker at `47a050f` and preserves cards 50 and 16.
+Lane removal shipped on Control Board on September 16. Its optional legacy inputs
+remain compatible with this worker.
 
-Most AI coding agents run in the cloud or sandboxed environments. **Night Shift Agent runs locally on your machine**—because mobile development demands it.
+## Install and verify
 
-Mobile apps require platform SDKs (Android SDK, Xcode), emulators, proprietary build systems (Gradle, CocoaPods), and hardware-specific testing that simply can't run in a generic cloud container. This agent is designed to work *with* your local development environment, not around it.
-
----
-
-## Quick Start
-
-```bash
-# 1. Clone the agent
-git clone https://github.com/chrishonson/night-shift-agent.git
-cd night-shift-agent
-
-# 2. Setup Python environment
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-
-# 3. Configure
-cp .env.example .env
-# Edit .env with your credentials
-
-# 4. Run against your project
-python agent_night_shift.py --project-dir /path/to/your/project
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python scripts/run-gate.py worker_tests
+.venv/bin/python scripts/run-gate.py worker_syntax
 ```
 
----
+## Run one board card
 
-## How It Works
+Use a clean, isolated target checkout whose directory name matches the card's repo.
+It must contain `verification.json` and `scripts/run-gate.py`, with the card's declared
+gates. Test/build commands, interpreter, SDK selection and coverage floors belong to
+that repository. There are no implicit Gradle commands. KMP repositories declare
+Gradle/Xcode gates; other repositories declare their own commands.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                   Night Shift Agent v3.6                        │
-│                                                                 │
-│   tasks.txt ──▶ LLM (Gemini/Claude) ──▶ Code Changes ──▶ PR     │
-│                        │                                        │
-│              ┌─────────┴─────────┐                              │
-│              │      7 Tools      │                              │
-│              ├───────────────────┤                              │
-│              │ read_file         │                              │
-│              │ write_file        │                              │
-│              │ replace           │                              │
-│              │ list_files        │                              │
-│              │ run_shell         │                              │
-│              │ run_tests         │                              │
-│              │ verify_build      │                              │
-│              └───────────────────┘                              │
-└─────────────────────────────────────────────────────────────────┘
+```sh
+cd /Users/nick/git/night-shift-supported
+FORCE_PROVIDER=ollama OLLAMA_MODEL='<already-installed-model>' \
+NIGHT_SHIFT_RECORD_DIR='/Users/nick/git/.night-shift-records' \
+.venv/bin/python agent_night_shift.py \
+  --project-dir '/absolute/path/to/isolated/repository-name' \
+  --repos repository-name --max-runs 1 --until-empty
 ```
 
-The agent operates in a TDD loop:
-1. **Read** the next uncompleted task from `tasks.txt`
-2. **Understand** the codebase using `list_files` and `read_file`
-3. **Write tests first** using `write_file` (TDD red phase)
-4. **Run tests** with `run_tests` to confirm they fail
-5. **Implement** code to make tests pass (TDD green phase)
-6. **Verify** with `verify_build` (build + tests + coverage)
-7. **Commit** when verification passes
-8. **Repeat** until all tasks are complete
-9. **Push** and create Pull Request
+Choose the model explicitly. `ollama` uses only local inference. Other existing
+headless adapters may fall back to Ollama; consult `ProviderManager` before choosing
+a chain. No quota scheduler or automatic model-tier promotion is supported.
+Board credentials use the existing Secret Manager/identity configuration. Never
+put credentials into URLs or task files. Scope the worker identity to software repos;
+non-software cards received accidentally are returned blocked for a coordinator.
 
-### LLM Provider Failover
+The runner does not automatically push, create a PR or monitor remote CI. Shell tools
+are not a security sandbox: run only trusted bounded tasks in an appropriate local
+execution environment. Publication and credential operations are outside this worker's
+supported purpose.
 
-The agent supports **automatic failover** between LLM providers:
+## Records and completion
 
-1. **Gemini CLI** (primary) - uses `gemini` command
-2. **Claude CLI** - uses `claude --print`
-3. **OpenRouter API** - requires `OPENROUTER_API_KEY`
-4. **Ollama** - local inference at `localhost:11434`
+Each board attempt writes an independent record directory with manifest, ordered
+redacted diagnostic events and patch. Default capture is metadata-only; payloads are
+not retained. Use `NIGHT_SHIFT_CAPTURE_MODE=payload` only when full context capture is
+appropriate for the target's data. Missing acceptance evidence is not a quality pass.
 
-When any provider hits a rate limit or quota, it automatically switches to the next.
-
----
-
-## Configuration
-
-Create a `.env` file (copy from `.env.example`):
-
-```bash
-# Required
-GH_BOT_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxx  # GitHub PAT with repo access
-
-# Optional - Agent Configuration
-BOT_USERNAME=agentnightshift                    # Git commit author (default: agentnightshift)
-PREFERRED_AGENT_MODEL=gemini-2.5-flash-lite     # Gemini model (default: gemini-2.5-flash-lite)
-
-# Optional - Additional Providers
-OLLAMA_MODEL=deepseek-r1:32b                    # Ollama model (default: deepseek-r1:32b)
-OPENROUTER_API_KEY=sk-or-...                    # OpenRouter API key
-OPENROUTER_MODEL=google/gemini-2.0-flash-exp:free  # OpenRouter model
+```sh
+.venv/bin/python scripts/run-record.py validate /path/to/record
+.venv/bin/python scripts/run-record.py review /path/to/record
 ```
 
-### GitHub Token Permissions
-
-Your `GH_BOT_TOKEN` needs these permissions:
-- **Contents**: Read and write
-- **Pull requests**: Read and write
-- **Metadata**: Read-only
-- **Actions**: Read-only (for CI monitoring)
-
----
-
-## Task File Format
-
-Create a `tasks.txt` in your target project:
-
-```text
-Add a dark mode toggle to the settings screen
-Implement unit tests for UserStore
-Fix the login button accessibility label
-```
-
-After processing:
-```text
-[x] Add a dark mode toggle to the settings screen
-[x] Implement unit tests for UserStore
-[!] Fix the login button accessibility label
-```
-
-- `[x]` = Completed successfully
-- `[!]` = Failed (agent couldn't complete)
-- Lines starting with `#` are ignored (comments)
-
----
-
-## Protected Files
-
-The agent **cannot modify** these critical build files (configurable in script):
-
-- `build.gradle.kts`
-- `settings.gradle.kts`
-- `gradle.properties`
-- `libs.versions.toml`
-- `gradle-wrapper.properties`
-- `tasks.txt`
-
----
-
-## Logs
-
-Session logs are saved to `.agent_logs/` in the target project directory:
-
-```
-.agent_logs/
-├── session_20251225_144005.log    # Main agent activity log
-├── prompts_20251225_144005.log    # Full LLM prompts & responses
-└── ...
-```
-
-| File | Contents |
-|------|----------|
-| `session_*.log` | Agent operations, tool calls, build results |
-| `prompts_*.log` | Complete LLM conversations (useful for debugging) |
-
----
-
-## Reliability Features
-
-The agent includes several safeguards to prevent runaway failures:
-
-### Checkpoints & Auto-Revert
-
-After each **successful build**, the agent saves a snapshot of all modified files. If the agent encounters **5 consecutive build failures**, it will:
-
-1. Automatically revert all changed files to the last known-good checkpoint
-2. Notify itself to "try a simpler approach"
-3. Reset the failure counter and continue
-
-This prevents the agent from spiraling into an infinite loop of failed attempts.
-
-**Log example:**
-```
-⚠️ Consecutive build failures: 5/5
-🔄 AUTO-REVERT: 5 consecutive failures, restoring checkpoint...
-   ↩️ Reverted: ChatService.kt
-   ↩️ Reverted: App.kt
-📸 Reverted 2 files to checkpoint. Agent notified to try simpler approach.
-```
-
-### Rate Limiting
-
-To prevent command spam (e.g., retrying the same failing build), the agent enforces rate limits:
-
-- **Same command limit**: Max 3 identical commands within 30 seconds
-- When rate-limited, the agent is told to read error logs and try a different approach
-
-### Context Pruning
-
-When conversation context exceeds 30,000 characters, the agent automatically drops the oldest message pairs (preserving system prompt and current task) to stay within limits.
-
----
-
-## Project Integration
-
-### For Kotlin Multiplatform Projects
-
-See [kmp-agentic-ci-template](https://github.com/chrishonson/kmp-agentic-ci-template) for a complete example including:
-- MVI Architecture documentation
-- GitHub Actions CI pipeline
-- Self-hosted runner setup for UI tests
-- Branch protection configuration
-
-### For All Projects
-
-1. **Enable Branch Protection**
-   - Since the agent needs write access, you **MUST** protect your `main` branch.
-   - Go to Repo Settings → Branches → Add Rule → `main` → Check "Require a pull request before merging".
-
-2. **Create an `ARCHITECTURE.md`** in your project root describing patterns/conventions.
-   <details>
-   <summary>Click to see ARCHITECTURE.md example</summary>
-
-   ```markdown
-   # Project Architecture
-
-   ## Patterns
-   - We use MVI (Model-View-Intent) architecture
-   - State is immutable
-   - ViewModels are called "Stores"
-
-   ## Naming Conventions
-   - Screen composables: `[Name]Screen.kt`
-   - State classes: `[Name]State`
-   - Intent sealed interfaces: `[Name]Intent`
-
-   ## Testing
-   - Unit tests go in `src/test/`
-   - UI tests go in `src/androidTest/`
-   ```
-   </details>
-
-3. **Create a `tasks.txt`** with your tasks (and maybe add it to `.gitignore`!).
-
-4. **Run the agent**:
-
-```bash
-python agent_night_shift.py --project-dir /path/to/project
-```
-
----
-
-## Self-Hosted Runner Setup
-
-If your project includes UI tests that run on a self-hosted runner (like `connectedAndroidTest`), you'll need to configure your local machine as a GitHub Actions runner.
-
-### First-Time Setup
-
-Follow the complete setup in your project's `docs/RUNNER_SETUP.md`.
-
-
-### Running Multiple Repos (Organization Runner)
-
-Register a runner at the **organization level** instead:
-
-1. Go to: `github.com/organizations/YOUR_ORG/settings/actions/runners`
-2. Add a new runner at org level
-3. The runner will be available to all repos in that org
-
----
-
-## Troubleshooting
-
-| Issue | Solution |
-|-------|----------|
-| `GH_BOT_TOKEN not set` | Add token to `.env` file |
-| `No tasks.txt found` | Create `tasks.txt` in project root |
-| Agent modifies wrong files | Add files to `PROTECTED_FILES` in `agent_night_shift.py` |
-| Build always fails | Check that build command works manually |
-| CI status not detected | Verify `gh` CLI is authenticated |
-
----
-
-## Best Practices
-
-1. **Small, focused tasks** — "Add a logout button" works better than "Refactor the entire auth flow"
-2. **Context is King** — A detailed `ARCHITECTURE.md` helps the agent mimic your coding style
-3. **Review PRs** — The agent is autonomous but not infallible; always review code before merging
-4. **Branch Protection** — Use CI guardrails to prevent broken code from hitting main
-
----
-
-## Why This Exists
-
-This project explores **agentic CI/CD**—the idea that an AI agent can:
-1. Receive high-level tasks
-2. Autonomously implement them
-3. Verify correctness through existing guardrails (builds, tests, linters)
-4. Submit changes for human review via pull requests
-5. Iterate on feedback by continuing work on rejected PRs
-
----
-
-| Document | Description |
-|----------|-------------|
-| [KMP Template](https://github.com/chrishonson/kmp-agentic-ci-template) | Example mobile project |
-
----
-
-*Built with [Gemini AI](https://ai.google.dev/) and [Claude AI](https://claude.ai/).*
+A passing gate is build/test evidence. A no-change success additionally requires
+explicit goal-specific acceptance criteria. Stalls return blocked rather than
+repeatedly consuming attempts. Inspect the record and diff before accepting a result.
+A lost release acknowledgement is recorded as unknown; reconcile the board before
+retrying. Never overwrite prior records to make a failed attempt look successful.
+
+## Archived experiments
+
+Context decision probes, board-reconciliation benchmarks and frozen research datasets
+are outside the supported checkout, in:
+`/Users/nick/git/.priority-intake/2026-09-16-night-shift-consolidation/experiments/`.
+The adjacent `pre-consolidation.bundle` preserves their full original source/history.
+Existing run-record fixtures remain regression tests of recording and coding safeguards;
+they are not a benchmark or a training dataset program.
+
+See `docs/CONSOLIDATION.md` for provenance, evidence and outstanding integration decisions.

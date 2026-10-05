@@ -1,0 +1,166 @@
+{
+  "schema_version": "s4-run-record.v1",
+  "record_id": "b3ba4d14-4be4-48bc-bb27-7f40d6896b8f",
+  "trace_id": "fa4b329e-f927-4efd-8e4b-c5b1dad86be6",
+  "created_at_iso": "2026-09-13T23:04:46.997108+00:00",
+  "evidence_class": "scripted_provider_fixture",
+  "real_model_evidence": {
+    "status": "unavailable",
+    "reason": "no_real_model_run_for_card_50"
+  },
+  "mode": "payload",
+  "task": {
+    "id": "CARD-S4-E2E-SAMPLE",
+    "title": "Implement greeting function",
+    "goal": "Implement greet(name: str) in greeter.py returning 'Hello, {name}!' and pass unit_tests",
+    "kind": "software",
+    "repo": "sample-greeter",
+    "gate_ids": [
+      "unit_tests"
+    ],
+    "acceptance_criteria": [
+      {
+        "id": "defines_greet",
+        "description": "greeter.py defines function greet(name: str)",
+        "type": "file_contains",
+        "target": "greeter.py",
+        "pattern": "def greet("
+      },
+      {
+        "id": "correct_greeting",
+        "description": "greet('NightShift') returns 'Hello, NightShift!'",
+        "type": "python_eval",
+        "code": "from greeter import greet; assert greet('NightShift') == 'Hello, NightShift!'"
+      },
+      {
+        "id": "gate_passed",
+        "description": "verification gate unit_tests passed",
+        "type": "gate_status",
+        "gate_id": "unit_tests",
+        "expected_status": "passed"
+      }
+    ]
+  },
+  "environment": {
+    "starting_commit": "fa0f257b6e2c882a703ffc3e10b40a0140308aba",
+    "starting_dirty": false,
+    "untracked_files": [],
+    "branch": "main",
+    "harness_source_hash": "7863b3f711b542124020437247123ea33c108ef5446bde72adaf6baf4b16fd51",
+    "python_version": "3.13.5",
+    "platform": "darwin"
+  },
+  "harness_configuration": {
+    "max_iterations": 80,
+    "max_context_chars": 80000,
+    "providers": [
+      {
+        "name": "S4 Scripted Greeter Provider",
+        "model": null,
+        "kind": "headless"
+      }
+    ],
+    "quota_reader": {
+      "status": "unavailable",
+      "reason": "deferred_offline"
+    }
+  },
+  "execution_summary": {
+    "iterations": 3,
+    "provider_attempts": [
+      {
+        "decision_id": 1,
+        "provider": "S4 Scripted Greeter Provider",
+        "status": "returned",
+        "duration_ms": 0
+      },
+      {
+        "decision_id": 2,
+        "provider": "S4 Scripted Greeter Provider",
+        "status": "returned",
+        "duration_ms": 0
+      },
+      {
+        "decision_id": 3,
+        "provider": "S4 Scripted Greeter Provider",
+        "status": "returned",
+        "duration_ms": 0
+      }
+    ],
+    "failover_attribution": [],
+    "tool_calls": [
+      {
+        "tool": "read_file",
+        "args": {
+          "path": "greeter.py"
+        },
+        "duration_ms": 0,
+        "status": "ok",
+        "output_chars": 65
+      },
+      {
+        "tool": "write_file",
+        "args": {
+          "path": "greeter.py",
+          "content": "def greet(name: str) -> str:\n    return f\"Hello, {name}!\"\n"
+        },
+        "duration_ms": 0,
+        "status": "ok",
+        "output_chars": 32
+      },
+      {
+        "tool": "verify_build",
+        "args": {},
+        "duration_ms": 258,
+        "status": "ok",
+        "output_chars": 64
+      }
+    ],
+    "verification": {
+      "attempted": true,
+      "passed": true,
+      "gates": [
+        {
+          "gate_id": "unit_tests",
+          "status": "passed",
+          "duration_ms": 257
+        }
+      ]
+    },
+    "independent_acceptance": {
+      "evaluated": true,
+      "passed": true,
+      "criteria": [
+        {
+          "id": "defines_greet",
+          "description": "greeter.py defines function greet(name: str)",
+          "type": "file_contains",
+          "passed": true,
+          "detail": "Pattern 'def greet(' found in greeter.py"
+        },
+        {
+          "id": "correct_greeting",
+          "description": "greet('NightShift') returns 'Hello, NightShift!'",
+          "type": "python_eval",
+          "passed": true,
+          "detail": "Python assertion succeeded"
+        },
+        {
+          "id": "gate_passed",
+          "description": "verification gate unit_tests passed",
+          "type": "gate_status",
+          "passed": true,
+          "detail": "Gate 'unit_tests' status is 'passed'"
+        }
+      ]
+    },
+    "terminal_outcome": "succeeded",
+    "release_status": "acknowledged",
+    "complete": true
+  },
+  "artifacts": {
+    "events": "events.jsonl",
+    "patch": "patch.diff",
+    "final_patch_stat": "greeter.py | 3 +--\n 1 file changed, 1 insertion(+), 2 deletions(-)"
+  }
+}
