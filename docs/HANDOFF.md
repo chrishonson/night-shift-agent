@@ -12,8 +12,8 @@ the evidence, and start the next piece of work without reconstructing branch his
 
 ## Supported worker
 
-- Checkout: `/Users/nick/git/night-shift-supported` (worktree of `night-shift-agent`)
-- Branch: `codex/night-shift-supported`
+- Checkout: `/Users/nick/git/night-shift-agent`
+- Branch: `main` (the supported branch was merged into main on 2026-10-05 and its separate checkout removed)
 - Base: `47a050f` (local integration #53, recorder #50, no-change #16, stall #17)
 - Purpose: execute one bounded software task in an explicitly selected local
   repository, run that repository's declared verification gates, and return local
@@ -22,7 +22,7 @@ the evidence, and start the next piece of work without reconstructing branch his
 Launch:
 
 ```sh
-cd /Users/nick/git/night-shift-supported
+cd /Users/nick/git/night-shift-agent
 FORCE_PROVIDER=ollama OLLAMA_MODEL='<already-installed-model>' \
 NIGHT_SHIFT_RECORD_DIR='/Users/nick/git/.night-shift-records' \
 .venv/bin/python agent_night_shift.py \

@@ -7,7 +7,7 @@ This worker is not a general planning assistant, model-training system or evalua
 
 ## Supported local version
 
-Use `/Users/nick/git/night-shift-supported`, branch `codex/night-shift-supported`.
+Use `/Users/nick/git/night-shift-agent`, branch `main`. The supported worker was merged into main on 2026-10-05.
 Older worktrees are evidence, not alternative launch locations. This branch starts
 from card-17's combined worker at `47a050f` and preserves cards 50 and 16.
 Lane removal shipped on Control Board on September 16. Its optional legacy inputs
@@ -31,7 +31,7 @@ that repository. There are no implicit Gradle commands. KMP repositories declare
 Gradle/Xcode gates; other repositories declare their own commands.
 
 ```sh
-cd /Users/nick/git/night-shift-supported
+cd /Users/nick/git/night-shift-agent
 FORCE_PROVIDER=ollama OLLAMA_MODEL='<already-installed-model>' \
 NIGHT_SHIFT_RECORD_DIR='/Users/nick/git/.night-shift-records' \
 .venv/bin/python agent_night_shift.py \
