@@ -5,7 +5,16 @@ source `649e1b2`. Both functions updated successfully and are ACTIVE:
 `controlplanemcp-00024-feq`, `controlplaneleasereaper-00004-rox`.
 Post-release board and feedback HTTP/MCP checks passed. #57 is ready with no
 blockers, no lease and zero attempts; claimed count is zero. This supersedes the
-historical deployment-deferral statements below. Git publication is still deferred.
+historical deployment-deferral statements below. Git publication was still deferred when
+this was written; see the 2026-10-08 update that follows.
+
+**Update 2026-10-08.** Git publication is no longer deferred. The supported worker was
+merged into `main` and pushed on 2026-10-05 (pull requests 3, 4 and 5 are merged), together
+with model-tier escalation (card 18). The worker now launches from
+`/Users/nick/git/night-shift-agent` on `main`, and the separate `night-shift-supported`
+checkout is gone. Gates on `main` on 2026-10-08: `worker_tests` 182 passed, 73.5% coverage
+(floor 55%), `worker_syntax` exit 0, `nightshift_quality` 182 passed. No production claim,
+heartbeat or release has been exercised from this checkout since the merge.
 
 Consolidation is closed. What follows is everything needed to run the worker, find
 the evidence, and start the next piece of work without reconstructing branch history.
@@ -73,7 +82,7 @@ a contract gets an error, not a guessed Gradle invocation. Operational detail
 
 | Check | Result |
 |---|---|
-| `worker_tests` gate | 141 passed, 72.8% coverage (floor 55%) |
+| `worker_tests` gate | 182 passed, 73.5% coverage (floor 55%), run 2026-10-08 on `main`. It was 141 passed on 2026-09-17, before model-tier escalation. |
 | `worker_syntax` gate | exit 0 |
 | Real-model coding task on this branch | succeeded, 118.9s, Ollama `qwen3.8:27b` |
 | Declared gate in the target | `unit_tests` passed |
@@ -92,8 +101,8 @@ does not certify.
   `lanes` block. `card_claim` still accepts an optional lane and `card_create` still
   accepts an optional placement, so the supported worker needed no change and a
   lane-sending claim was accepted after the release.
-- **Model-tier escalation (card 18).** Backlog. Its blockers (50, 17) are done, so
-  it is merely unstarted, not stuck.
+- **Model-tier escalation (card 18).** Landed on `main` on 2026-10-05 and off by default
+  (see the README). It has not run against a live card yet.
 - **Board observability routine (card 21)** and **flashy-card contact session (card 20)**.
   Card 20's dead blocker (abandoned card 14) was cleared; the JDK prerequisite behind
   it is still unmet.

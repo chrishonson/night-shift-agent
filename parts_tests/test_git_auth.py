@@ -46,6 +46,9 @@ def ran(monkeypatch):
         return subprocess_result(0, "ok")
 
     monkeypatch.setattr(toolbox, "exec_command", fake_exec)
+    # A bare `git push` is judged by the checkout's branch, and the repo under test is
+    # this one, which is on main. Pin a card branch so the tests do not depend on it.
+    monkeypatch.setattr(toolbox, "_current_branch", lambda: "nightshift/abc123")
     seen["toolbox"] = toolbox
     return seen
 

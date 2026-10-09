@@ -41,7 +41,7 @@ NIGHT_SHIFT_RECORD_DIR='/Users/nick/git/.night-shift-records' \
 
 Choose the model explicitly. `ollama` uses only local inference. Other existing
 headless adapters may fall back to Ollama; consult `ProviderManager` before choosing
-a chain. No quota scheduler or automatic model-tier promotion is supported.
+a chain. No quota scheduler is supported. Model-tier escalation is opt-in, see below.
 Board credentials use the existing Secret Manager/identity configuration. Never
 put credentials into URLs or task files. Scope the worker identity to software repos;
 non-software cards received accidentally are returned blocked for a coordinator.
